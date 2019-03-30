@@ -3126,6 +3126,182 @@ COMMAND_HANDLER(aarch64_mask_interrupts_command)
 	return ERROR_OK;
 }
 
+/* convert bitlen bits of v to string b
+   assuming b is at least bitlen+1 size */
+static void tobin(char *b, uint32_t v, uint8_t bitlen)
+{
+	size_t j = 0;
+	for (int i = bitlen - 1; i >= 0; i--) {
+		if (v & (1 << i))
+			b[j] = '1';
+		else
+			b[j] = '0';
+		j++;
+	}
+	b[j] = 0;
+}
+
+static inline uint32_t get_aarch64_system_register_encoding(uint8_t op0,
+		uint8_t op1,
+		uint8_t crn,
+		uint8_t crm,
+		uint8_t op2)
+{
+	return (op0 << 14) |
+		(op1 << 11) |
+		(crn << 7) |
+		(crm << 3) |
+		op2;
+}
+
+static int get_aarch64_system_register_encoding_from_command_arguments(struct command_invocation *cmd,
+		uint32_t *encoding)
+{
+	uint8_t op0;
+	uint8_t op1;
+	uint8_t crn;
+	uint8_t crm;
+	uint8_t op2;
+
+	COMMAND_PARSE_NUMBER(u8, CMD_ARGV[0], op0);
+	COMMAND_PARSE_NUMBER(u8, CMD_ARGV[1], op1);
+	COMMAND_PARSE_NUMBER(u8, CMD_ARGV[2], crn);
+	COMMAND_PARSE_NUMBER(u8, CMD_ARGV[3], crm);
+	COMMAND_PARSE_NUMBER(u8, CMD_ARGV[4], op2);
+
+	if (op0 > 3) {
+		command_print(cmd, "op0 should be <= 3");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+	if (op1 > 7) {
+		command_print(cmd, "op1 should be <= 7");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+	if (crn > 15) {
+		command_print(cmd, "CRn should be <= 15");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+	if (crm > 15) {
+		command_print(cmd, "CRm should be <= 15");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+	if (op2 > 7) {
+		command_print(cmd, "op2 should be <= 7");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+
+	*encoding = get_aarch64_system_register_encoding(op0,
+			op1, crn, crm, op2);
+
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(aarch64_handle_msr_command)
+{
+	struct target *target = get_current_target(CMD_CTX);
+	struct arm *arm = target_to_arm(target);
+	struct arm_dpm *dpm = arm->dpm;
+	uint64_t value;
+	uint32_t encoding;
+	int retval;
+
+	if (target->state != TARGET_HALTED) {
+		LOG_WARNING("target not halted");
+		return ERROR_TARGET_NOT_HALTED;
+	}
+
+	switch (CMD_ARGC) {
+	case 6:
+		COMMAND_PARSE_NUMBER(u64, CMD_ARGV[5], value);
+		retval = get_aarch64_system_register_encoding_from_command_arguments(cmd,
+				&encoding);
+		if (retval != ERROR_OK)
+			return ERROR_COMMAND_SYNTAX_ERROR;
+		break;
+
+	default:
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+
+	retval = dpm->prepare(dpm);
+
+	if (retval != ERROR_OK)
+		return retval;
+
+	/* rt is implictly 0 below in order to get this from arguments,
+	 * dpm should be modified as well */
+	retval = dpm->instr_write_data_r0_64(dpm,
+			ARMV8_MSR_GP(encoding, 0),
+			value);
+
+	/* (void) */ dpm->finish(dpm);
+	return retval;
+}
+
+COMMAND_HANDLER(aarch64_handle_mrs_command)
+{
+	struct target *target = get_current_target(CMD_CTX);
+	struct arm *arm = target_to_arm(target);
+	struct arm_dpm *dpm = arm->dpm;
+	uint32_t encoding;
+	int retval;
+
+	if (target->state != TARGET_HALTED) {
+		LOG_WARNING("target not halted");
+		return ERROR_TARGET_NOT_HALTED;
+	}
+
+	switch (CMD_ARGC) {
+	case 5:
+		retval = get_aarch64_system_register_encoding_from_command_arguments(cmd,
+				&encoding);
+		if (retval != ERROR_OK)
+			return ERROR_COMMAND_SYNTAX_ERROR;
+
+		break;
+
+	default:
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+
+	retval = dpm->prepare(dpm);
+
+	if (retval != ERROR_OK)
+		return retval;
+
+	uint64_t value;
+
+	/* rt is implictly 0 below in order to get this from arguments,
+	 * dpm should be modified as well */
+	retval = dpm->instr_read_data_r0_64(dpm,
+			ARMV8_MRS(encoding, 0),
+			&value);
+	if (retval == ERROR_OK) {
+		char op0v[3];
+		char op1v[4];
+		char crnv[5];
+		char crmv[5];
+		char op2v[4];
+
+		tobin(op0v, (encoding >> 14) & 0x3, 2);
+		tobin(op1v, (encoding >> 11) & 0x7, 3);
+		tobin(crnv, (encoding >> 7) & 0xF, 4);
+		tobin(crmv, (encoding >> 3) & 0xF, 4);
+		tobin(op2v, (encoding & 0x7), 3);
+
+		command_print(cmd, "S%s_%s_%s_%s_%s: 0x%016" PRIx64,
+				op0v,
+				op1v,
+				crnv,
+				crmv,
+				op2v,
+				value);
+	}
+
+	/* (void) */ dpm->finish(dpm);
+	return retval;
+}
+
 COMMAND_HANDLER(aarch64_mcrmrc_command)
 {
 	bool is_mcr = false;
@@ -3264,6 +3440,20 @@ static const struct command_registration aarch64_exec_command_handlers[] = {
 		.handler = aarch64_mcrmrc_command,
 		.help = "read coprocessor register",
 		.usage = "cpnum op1 CRn CRm op2",
+	},
+	{
+		.name = "msr",
+		.handler = aarch64_handle_msr_command,
+		.mode = COMMAND_EXEC,
+		.help = "write to system register",
+		.usage = "op0 op1 CRn CRm op2 value",
+	},
+	{
+		.name = "mrs",
+		.handler = aarch64_handle_mrs_command,
+		.mode = COMMAND_EXEC,
+		.help = "read from system register",
+		.usage = "op0 op1 CRn CRm op2",
 	},
 	{
 		.chain = smp_command_handlers,

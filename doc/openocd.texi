@@ -11541,6 +11541,16 @@ Consider using a newer version of gdb if you want to enable pauth feature.
 The default configuration is @option{off}.
 @end deffn
 
+@deffn Command {aarch64 mrs} op0 op1 CRn CRm op2
+Read the system register encoded with
+@var{op0}, @var{op1}, @var{CRn}, @var{CRm}, @var{op2}
+@end deffn
+
+@deffn Command {aarch64 msr} op0 op1 CRn CRm op2 value
+Write @var{value} to the system register encoded with
+@var{op0}, @var{op1}, @var{CRn}, @var{CRm}, @var{op2}
+using the MSR instruction.
+@end deffn
 
 @section EnSilica eSi-RISC Architecture
 

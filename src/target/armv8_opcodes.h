@@ -131,10 +131,10 @@
 #define ARMV8_ISB				0xd5033fdf
 #define ARMV8_ISB_SY_T1				0xf3bf8f6f
 
-#define ARMV8_MRS(system, rt)	(0xd5300000 | ((system) << 5) | (rt))
+#define ARMV8_MRS(system, rt)	(0xd5200000 | ((system) << 5) | (rt))
 /* ARM V8 Move to system register. */
 #define ARMV8_MSR_GP(system, rt) \
-	(0xd5100000 | ((system) << 5) | (rt))
+	(0xd5000000 | ((system) << 5) | (rt))
 /* ARM V8 Move immediate to process state field. */
 #define ARMV8_MSR_IM(op1, crm, op2) \
 	(0xd500401f | ((op1) << 16)  | ((crm) << 8) | ((op2) << 5))
