@@ -19,7 +19,8 @@
  * the command has the host scan in from the device, the host scan out
  * to the device, or both.
  */
-enum scan_type {
+enum scan_type
+{
 	/** From device to host, */
 	SCAN_IN = 1,
 	/** From host to device, */
@@ -32,7 +33,8 @@ enum scan_type {
  * The scan_command provide a means of encapsulating a set of scan_field
  * structures that should be scanned in/out to the device.
  */
-struct scan_command {
+struct scan_command
+{
 	/** instruction/not data scan */
 	bool ir_scan;
 	/** number of fields in *fields array */
@@ -41,47 +43,66 @@ struct scan_command {
 	struct scan_field *fields;
 	/** state in which JTAG commands should finish */
 	enum tap_state end_state;
+
+	/* ***** IMPORTANT ********************
+	 *	Please take not that virtual jtag,
+	 *	i.e. #vjtag_tap, relies EXCLUSIVELY on the fields
+	 *	below to read/write to JTAG
+	 **************************************/
+	/** JTAG TAP for which this scan command is targeted at */
+	struct jtag_tap *tap;
+	/** is tap a virtual JTAG/SLD node? */
+	bool tap_is_sld;
+	/** pointer to <tt>scan_field</tt>s for \c tap in \c fields */
+	struct scan_field *tap_fields;
+	/** number of fields for \c tap */
+	int num_tap_fields;
 };
 
-struct statemove_command {
+struct statemove_command
+{
 	/** state in which JTAG commands should finish */
 	enum tap_state end_state;
 };
 
-struct pathmove_command {
+struct pathmove_command
+{
 	/** number of states in *path */
 	unsigned int num_states;
 	/** states that have to be passed */
 	enum tap_state *path;
 };
 
-struct runtest_command {
+struct runtest_command
+{
 	/** number of cycles to spend in Run-Test/Idle state */
 	unsigned int num_cycles;
 	/** state in which JTAG commands should finish */
 	enum tap_state end_state;
 };
 
-
-struct stableclocks_command {
+struct stableclocks_command
+{
 	/** number of clock cycles that should be sent */
 	unsigned int num_cycles;
 };
 
-
-struct reset_command {
+struct reset_command
+{
 	/** Set TRST output: 0 = deassert, 1 = assert, -1 = no change */
 	int trst;
 	/** Set SRST output: 0 = deassert, 1 = assert, -1 = no change */
 	int srst;
 };
 
-struct end_state_command {
+struct end_state_command
+{
 	/** state in which JTAG commands should finish */
 	enum tap_state end_state;
 };
 
-struct sleep_command {
+struct sleep_command
+{
 	/** number of microseconds to sleep */
 	uint32_t us;
 };
@@ -98,7 +119,8 @@ struct sleep_command {
  * In SWD mode these are clocked out on SWDIO, using SWCLK, and are
  * used for link resets and transitioning between SWD and JTAG modes.
  */
-struct tms_command {
+struct tms_command
+{
 	/** How many bits should be clocked out. */
 	unsigned int num_bits;
 	/** The bits to clock out; the LSB is bit 0 of bits[0]. */
@@ -109,7 +131,8 @@ struct tms_command {
  * Defines a container type that hold a pointer to a JTAG command
  * structure of any defined type.
  */
-union jtag_command_container {
+union jtag_command_container
+{
 	struct scan_command *scan;
 	struct statemove_command *statemove;
 	struct pathmove_command *pathmove;
@@ -125,8 +148,9 @@ union jtag_command_container {
  * The type of the @c jtag_command_container contained by a
  * @c jtag_command structure.
  */
-enum jtag_command_type {
-	JTAG_SCAN         = 1,
+enum jtag_command_type
+{
+	JTAG_SCAN = 1,
 	/* JTAG_TLR_RESET's non-minidriver implementation is a
 	 * vestige from a statemove cmd. The statemove command
 	 * is obsolete and replaced by pathmove.
@@ -134,16 +158,17 @@ enum jtag_command_type {
 	 * pathmove does not support reset as one of it's states,
 	 * hence the need for an explicit statemove command.
 	 */
-	JTAG_TLR_RESET    = 2,
-	JTAG_RUNTEST      = 3,
-	JTAG_RESET        = 4,
-	JTAG_PATHMOVE     = 6,
-	JTAG_SLEEP        = 7,
+	JTAG_TLR_RESET = 2,
+	JTAG_RUNTEST = 3,
+	JTAG_RESET = 4,
+	JTAG_PATHMOVE = 6,
+	JTAG_SLEEP = 7,
 	JTAG_STABLECLOCKS = 8,
-	JTAG_TMS          = 9,
+	JTAG_TMS = 9,
 };
 
-struct jtag_command {
+struct jtag_command
+{
 	union jtag_command_container cmd;
 	enum jtag_command_type type;
 	struct jtag_command *next;

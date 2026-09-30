@@ -224,6 +224,9 @@ m4_define([HOST_ARM_OR_AARCH64_BITBANG_ADAPTERS],
 m4_define([DUMMY_ADAPTER],
 	[[[dummy], [Dummy Adapter], [DUMMY]]])
 
+m4_define([AJI_CLIENT_ADAPTERS],
+	[[[aji_client], [Intel AJI Client Driver], [AJI_CLIENT]]])
+
 m4_define([OPTIONAL_LIBRARIES],
 	[[[capstone], [Use Capstone disassembly framework], []]])
 
@@ -305,6 +308,8 @@ AC_ARG_ADAPTERS([
   LIBJAYLINK_ADAPTERS,
   CMSIS_DAP_TCP_ADAPTER,
   NETWORK_ADAPTERS
+  LIBJAYLINK_ADAPTERS,
+  AJI_CLIENT_ADAPTERS
   ],[auto])
 
 AC_ARG_ADAPTERS([
@@ -370,6 +375,16 @@ AC_ARG_ENABLE([internal-libjaylink],
   AS_HELP_STRING([--enable-internal-libjaylink],
   [Enable building internal libjaylink]),
   [use_internal_libjaylink=$enableval], [use_internal_libjaylink=no])
+
+
+AC_ARG_ENABLE([internal-libaji_client],
+  AS_HELP_STRING([--disable-internal-libaji_client],
+  [Disable building internal lib_aji_client]),
+  [use_internal_libaji_client=$enableval], [use_internal_libaji_client=yes])
+
+AC_ARG_ENABLE([remote-bitbang],
+  AS_HELP_STRING([--enable-remote-bitbang], [Enable building support for the Remote Bitbang jtag driver]),
+  [build_remote_bitbang=$enableval], [build_remote_bitbang=no])
 
 AS_CASE(["${host_cpu}"],
   [i?86|x86*], [],
@@ -647,6 +662,7 @@ PROCESS_ADAPTERS([NETWORK_ADAPTERS], [true], [unused])
 AS_IF([test "x$enable_xvc" != "xno"], [
   build_bitbang=yes
 ])
+PROCESS_ADAPTERS([AJI_CLIENT_ADAPTERS], ["x$use_internal_libaji_client" = "xyes" -o "x$use_aji_client" = "xyes"], [aji_client])
 
 AS_IF([test "x$enable_linuxgpiod" != "xno"], [
   build_bitbang=yes
@@ -729,11 +745,14 @@ AM_CONDITIONAL([USE_LIBFTDI], [test "x$use_libftdi" = "xyes"])
 AM_CONDITIONAL([USE_LIBGPIOD], [test "x$use_libgpiod" = "xyes"])
 AM_CONDITIONAL([USE_HIDAPI], [test "x$use_hidapi" = "xyes"])
 AM_CONDITIONAL([USE_LIBJAYLINK], [test "x$use_libjaylink" = "xyes"])
+AM_CONDITIONAL([USE_LIBAJI_CLIENT], [test "x$use_libaji_client" = "xyes"])
+AM_CONDITIONAL([AJI_CLIENT], [test "x$enable_aji_client" != "xno"])
 AM_CONDITIONAL([HAVE_CAPSTONE], [test "x$enable_capstone" != "xno"])
 
 AM_CONDITIONAL([INTERNAL_JIMTCL], [test "x$use_internal_jimtcl" = "xyes"])
 AM_CONDITIONAL([HAVE_JIMTCL_PKG_CONFIG], [test "x$have_jimtcl_pkg_config" = "xyes"])
 AM_CONDITIONAL([INTERNAL_LIBJAYLINK], [test "x$use_internal_libjaylink" = "xyes"])
+AM_CONDITIONAL([INTERNAL_LIBAJI_CLIENT], [test "x$use_internal_libaji_client" = "xyes"])
 
 
 AM_CONDITIONAL([USE_GCOV], [test "x$enable_gcov" = "xyes"])
@@ -841,6 +860,7 @@ m4_foreach([adapter_driver], [USB1_ADAPTERS,
 	SYSFSGPIO_ADAPTER,
 	REMOTE_BITBANG_ADAPTER,
 	LIBJAYLINK_ADAPTERS, XVC_ADAPTERS,
+	AJI_CLIENT_ADAPTERS,
 	SERIAL_PORT_ADAPTERS,
 	PARALLEL_PORT_ADAPTER,
 	NETWORK_ADAPTERS,

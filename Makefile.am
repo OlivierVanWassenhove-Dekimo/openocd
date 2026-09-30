@@ -41,6 +41,10 @@ DIST_SUBDIRS += testing
 AM_CFLAGS = $(GCC_WARNINGS)
 AM_LDFLAGS =
 
+# To enable the use of unnamed struct in gcc <=9.2.0
+# Not needed for C11 compliant compiler.
+AM_CFLAGS += -fms-extensions
+
 AM_CPPFLAGS = $(HOST_CPPFLAGS)\
 			  -I$(top_srcdir)/src \
 			  -I$(top_builddir)/src \
@@ -63,6 +67,7 @@ EXTRA_DIST += \
 	BUGS \
 	HACKING \
 	NEWTAPS \
+	README.aji_client \
 	README.Windows.md \
 	README.macOS.md \
 	$(EXTRA_DIST_NEWS) \

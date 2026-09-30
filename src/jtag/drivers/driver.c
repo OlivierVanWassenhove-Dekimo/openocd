@@ -67,6 +67,10 @@ int interface_jtag_add_ir_scan(struct jtag_tap *active,
 	scan->fields = out_fields;
 	scan->end_state = state;
 
+	scan->tap = active;
+	scan->tap_is_sld = jtag_tap_on_all_vtaps_list(active);
+
+	struct jtag_tap *target = scan->tap_is_sld? ((struct vjtag_tap *) active)->parent : active;
 	struct scan_field *field = out_fields;	/* keep track where we insert data */
 
 	/* loop over all enabled TAPs */
@@ -74,10 +78,12 @@ int interface_jtag_add_ir_scan(struct jtag_tap *active,
 	for (struct jtag_tap *tap = jtag_tap_next_enabled(NULL); tap; tap = jtag_tap_next_enabled(tap)) {
 		/* search the input field list for fields for the current TAP */
 
-		if (tap == active) {
+		if (tap == target) {
 			/* if TAP is listed in input fields, copy the value */
 			tap->bypass = false;
 
+			scan->tap_fields = field;
+			scan->num_tap_fields = 1;
 			jtag_scan_field_clone(field, in_fields);
 		} else {
 			/* if a TAP isn't listed in input fields, set it to BYPASS */
@@ -114,7 +120,6 @@ int interface_jtag_add_dr_scan(struct jtag_tap *active, int in_num_fields,
 		const struct scan_field *in_fields, enum tap_state state)
 {
 	/* count devices in bypass */
-
 	size_t bypass_devices = 0;
 	size_t all_devices = 0;
 
@@ -145,6 +150,10 @@ int interface_jtag_add_dr_scan(struct jtag_tap *active, int in_num_fields,
 	scan->fields = out_fields;
 	scan->end_state = state;
 
+	scan->tap = active;
+	scan->tap_is_sld = jtag_tap_on_all_vtaps_list(active);
+
+	struct jtag_tap *target = scan->tap_is_sld? ((struct vjtag_tap *) active)->parent : active;
 	struct scan_field *field = out_fields;	/* keep track where we insert data */
 
 	/* loop over all enabled TAPs */
@@ -153,11 +162,14 @@ int interface_jtag_add_dr_scan(struct jtag_tap *active, int in_num_fields,
 		/* if TAP is not bypassed insert matching input fields */
 
 		if (!tap->bypass) {
-			assert(active == tap);
+			assert(target == tap);
 #ifndef NDEBUG
 			/* remember initial position for assert() */
 			struct scan_field *start_field = field;
 #endif /* NDEBUG */
+
+			scan->tap_fields = field;
+			scan->num_tap_fields = in_num_fields;
 
 			for (int j = 0; j < in_num_fields; j++) {
 				jtag_scan_field_clone(field, in_fields + j);

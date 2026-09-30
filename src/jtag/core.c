@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 /***************************************************************************
+ *   Copyright (C) 2021 Cinly Ooi                                          *
+ *   cinly.ooi@intel.com                                                   *
+ *                                                                         *
  *   Copyright (C) 2009 Zachary T Welch                                    *
  *   zw@superlucidity.net                                                  *
  *                                                                         *
@@ -31,6 +34,8 @@
 #include <strings.h>
 #endif
 
+#include "jtagcore_overwrite.h"
+
 /* SVF and XSVF are higher level JTAG command sets (for boundary scan) */
 #include "svf/svf.h"
 #include "xsvf/xsvf.h"
@@ -45,11 +50,11 @@ static unsigned int jtag_flush_queue_count;
 static int jtag_flush_queue_sleep;
 
 static void jtag_add_scan_check(struct jtag_tap *active,
-		void (*jtag_add_scan)(struct jtag_tap *active,
-		int in_num_fields,
-		const struct scan_field *in_fields,
-		enum tap_state state),
-		int in_num_fields, struct scan_field *in_fields, enum tap_state state);
+								void (*jtag_add_scan)(struct jtag_tap *active,
+													  int in_num_fields,
+													  const struct scan_field *in_fields,
+													  enum tap_state state),
+								int in_num_fields, struct scan_field *in_fields, enum tap_state state);
 
 static int jtag_error_clear(void);
 
@@ -94,16 +99,17 @@ static bool jtag_verify = true;
 
 /* how long the OpenOCD should wait before attempting JTAG communication after reset lines
  *deasserted (in ms) */
-static unsigned int adapter_nsrst_delay;	/* default to no nSRST delay */
-static unsigned int jtag_ntrst_delay;/* default to no nTRST delay */
-static unsigned int adapter_nsrst_assert_width;	/* width of assertion */
+static unsigned int adapter_nsrst_delay;		/* default to no nSRST delay */
+static unsigned int jtag_ntrst_delay;			/* default to no nTRST delay */
+static unsigned int adapter_nsrst_assert_width; /* width of assertion */
 static unsigned int jtag_ntrst_assert_width;	/* width of assertion */
 
 /**
  * Contains a single callback along with a pointer that will be passed
  * when an event occurs.
  */
-struct jtag_event_callback {
+struct jtag_event_callback
+{
 	/** a event callback */
 	jtag_event_handler_t callback;
 	/** the private data to pass to the callback */
@@ -182,6 +188,17 @@ void jtag_poll_unmask(bool saved)
 
 /************/
 
+/*
+ * JTAG Core function overwrite
+ */
+struct jtagcore_overwrite jtagcore_ovewrite_record;
+struct jtagcore_overwrite *jtagcore_get_overwrite_record(void)
+{
+	return &jtagcore_ovewrite_record;
+}
+
+/************/
+
 struct jtag_tap *jtag_all_taps(void)
 {
 	return __jtag_all_taps;
@@ -191,7 +208,8 @@ static unsigned int jtag_tap_count(void)
 {
 	struct jtag_tap *t = jtag_all_taps();
 	unsigned int n = 0;
-	while (t) {
+	while (t)
+	{
 		n++;
 		t = t->next_tap;
 	}
@@ -202,7 +220,8 @@ unsigned int jtag_tap_count_enabled(void)
 {
 	struct jtag_tap *t = jtag_all_taps();
 	unsigned int n = 0;
-	while (t) {
+	while (t)
+	{
 		if (t->enabled)
 			n++;
 		t = t->next_tap;
@@ -210,18 +229,24 @@ unsigned int jtag_tap_count_enabled(void)
 	return n;
 }
 
-/** Append a new TAP to the chain of all taps. */
-static void jtag_tap_add(struct jtag_tap *t)
+static void jtag_tap_add_imp(struct jtag_tap **list, struct jtag_tap *t)
 {
 	unsigned int jtag_num_taps = 0;
 
-	struct jtag_tap **tap = &__jtag_all_taps;
-	while (*tap) {
+	struct jtag_tap **tap = list;
+	while (*tap != NULL)
+	{
 		jtag_num_taps++;
 		tap = &(*tap)->next_tap;
 	}
 	*tap = t;
 	t->abs_chain_position = jtag_num_taps;
+}
+
+/** Append a new TAP to the chain of all taps. */
+void jtag_tap_add(struct jtag_tap *t)
+{
+	jtag_tap_add_imp(&__jtag_all_taps, t);
 }
 
 /* returns a pointer to the n-th device in the scan chain */
@@ -235,24 +260,74 @@ struct jtag_tap *jtag_tap_by_position(unsigned int n)
 	return t;
 }
 
-struct jtag_tap *jtag_tap_by_string(const char *s)
+struct jtag_tap *jtag_tap_by_string_imp(struct jtag_tap *list, const char *s)
 {
 	/* try by name first */
-	struct jtag_tap *t = jtag_all_taps();
+	struct jtag_tap *t = list;
 
-	while (t) {
+	while (t)
+	{
 		if (strcmp(t->dotted_name, s) == 0)
 			return t;
 		t = t->next_tap;
 	}
 
-	return NULL;
+	/* no tap found by name, so try to parse the name as a number */
+	/* s is not guaranteed to be an integer, particularly after
+		the introduction of vjtag as it means s can represent a tap
+		on another list. When this happens, parse_ullong(),
+		which is called by parse_unit() will display an error message.
+		To avoid this, s must be tested to contain a number.
+	*/
+	char *p;
+	long int val = strtol(s, &p, 10);
+	if (p != s && val >= 0)
+	{
+		unsigned n;
+		if (parse_uint(s, &n) != ERROR_OK)
+			return NULL;
+
+		/* FIXME remove this numeric fallback code late June 2010, along
+		 * with all info in the User's Guide that TAPs have numeric IDs.
+		 * Also update "scan_chain" output to not display the numbers.
+		 */
+		t = jtag_tap_by_position(n);
+		if (t)
+			LOG_WARNING("Specify TAP '%s' by name, not number %u, or number is less than zero",
+						t->dotted_name, n);
+	}
+	return t;
+}
+
+struct jtag_tap *jtag_tap_by_string(const char *s)
+{
+	return jtag_tap_by_string_imp(jtag_all_taps(), s);
+}
+
+bool jtag_tap_on_list(struct jtag_tap *list, const struct jtag_tap *const tap)
+{
+	struct jtag_tap *ptap = list;
+	while (ptap)
+	{
+		if (ptap == tap)
+		{
+			return true;
+		}
+		ptap = ptap->next_tap;
+	}
+	return false;
+}
+
+bool jtag_tap_on_all_taps_list(const struct jtag_tap *const tap)
+{
+	return jtag_tap_on_list(__jtag_all_taps, tap);
 }
 
 struct jtag_tap *jtag_tap_next_enabled(struct jtag_tap *p)
 {
 	p = p ? p->next_tap : jtag_all_taps();
-	while (p) {
+	while (p)
+	{
 		if (p->enabled)
 			return p;
 		p = p->next_tap;
@@ -265,7 +340,6 @@ const char *jtag_tap_name(const struct jtag_tap *tap)
 	return (!tap) ? "(unknown)" : tap->dotted_name;
 }
 
-
 int jtag_register_event_callback(jtag_event_handler_t callback, void *priv)
 {
 	struct jtag_event_callback **callbacks_p = &jtag_event_callbacks;
@@ -273,7 +347,8 @@ int jtag_register_event_callback(jtag_event_handler_t callback, void *priv)
 	if (!callback)
 		return ERROR_COMMAND_SYNTAX_ERROR;
 
-	if (*callbacks_p) {
+	if (*callbacks_p)
+	{
 		while ((*callbacks_p)->next)
 			callbacks_p = &((*callbacks_p)->next);
 		callbacks_p = &((*callbacks_p)->next);
@@ -294,8 +369,10 @@ int jtag_unregister_event_callback(jtag_event_handler_t callback, void *priv)
 	if (!callback)
 		return ERROR_COMMAND_SYNTAX_ERROR;
 
-	while (*p) {
-		if (((*p)->priv != priv) || ((*p)->callback != callback)) {
+	while (*p)
+	{
+		if (((*p)->priv != priv) || ((*p)->callback != callback))
+		{
 			p = &(*p)->next;
 			continue;
 		}
@@ -314,7 +391,8 @@ int jtag_call_event_callbacks(enum jtag_event event)
 
 	LOG_DEBUG("jtag event: %s", jtag_event_strings[event]);
 
-	while (callback) {
+	while (callback)
+	{
 		struct jtag_event_callback *next;
 
 		/* callback may remove itself */
@@ -341,7 +419,7 @@ static void jtag_prelude(enum tap_state state)
 }
 
 void jtag_add_ir_scan_noverify(struct jtag_tap *active, const struct scan_field *in_fields,
-	enum tap_state state)
+							   enum tap_state state)
 {
 	jtag_prelude(state);
 
@@ -350,9 +428,9 @@ void jtag_add_ir_scan_noverify(struct jtag_tap *active, const struct scan_field 
 }
 
 static void jtag_add_ir_scan_noverify_callback(struct jtag_tap *active,
-	int dummy,
-	const struct scan_field *in_fields,
-	enum tap_state state)
+											   int dummy,
+											   const struct scan_field *in_fields,
+											   enum tap_state state)
 {
 	jtag_add_ir_scan_noverify(active, in_fields, state);
 }
@@ -362,7 +440,8 @@ void jtag_add_ir_scan(struct jtag_tap *active, struct scan_field *in_fields, enu
 {
 	assert(state != TAP_RESET);
 
-	if (jtag_verify && jtag_verify_capture_ir) {
+	if (jtag_verify && jtag_verify_capture_ir)
+	{
 		/* 8 x 32 bit id's is enough for all invocations */
 
 		/* if we are to run a verification of the ir scan, we need to get the input back.
@@ -371,13 +450,14 @@ void jtag_add_ir_scan(struct jtag_tap *active, struct scan_field *in_fields, enu
 		in_fields->check_value = active->expected;
 		in_fields->check_mask = active->expected_mask;
 		jtag_add_scan_check(active, jtag_add_ir_scan_noverify_callback, 1, in_fields,
-			state);
-	} else
+							state);
+	}
+	else
 		jtag_add_ir_scan_noverify(active, in_fields, state);
 }
 
 void jtag_add_plain_ir_scan(int num_bits, const uint8_t *out_bits, uint8_t *in_bits,
-	enum tap_state state)
+							enum tap_state state)
 {
 	assert(out_bits);
 	assert(state != TAP_RESET);
@@ -385,48 +465,46 @@ void jtag_add_plain_ir_scan(int num_bits, const uint8_t *out_bits, uint8_t *in_b
 	jtag_prelude(state);
 
 	int retval = interface_jtag_add_plain_ir_scan(
-			num_bits, out_bits, in_bits, state);
+		num_bits, out_bits, in_bits, state);
 	jtag_set_error(retval);
 }
 
 static int jtag_check_value_inner(uint8_t *captured, uint8_t *in_check_value,
-				  uint8_t *in_check_mask, int num_bits);
+								  uint8_t *in_check_mask, int num_bits);
 
 static int jtag_check_value_mask_callback(jtag_callback_data_t data0,
-	jtag_callback_data_t data1,
-	jtag_callback_data_t data2,
-	jtag_callback_data_t data3)
+										  jtag_callback_data_t data1,
+										  jtag_callback_data_t data2,
+										  jtag_callback_data_t data3)
 {
 	return jtag_check_value_inner((uint8_t *)data0,
-		(uint8_t *)data1,
-		(uint8_t *)data2,
-		(int)data3);
+								  (uint8_t *)data1,
+								  (uint8_t *)data2,
+								  (int)data3);
 }
 
-static void jtag_add_scan_check(struct jtag_tap *active, void (*jtag_add_scan)(
-		struct jtag_tap *active,
-		int in_num_fields,
-		const struct scan_field *in_fields,
-		enum tap_state state),
-	int in_num_fields, struct scan_field *in_fields, enum tap_state state)
+static void jtag_add_scan_check(struct jtag_tap *active, void (*jtag_add_scan)(struct jtag_tap *active, int in_num_fields, const struct scan_field *in_fields, enum tap_state state),
+								int in_num_fields, struct scan_field *in_fields, enum tap_state state)
 {
 	jtag_add_scan(active, in_num_fields, in_fields, state);
 
-	for (int i = 0; i < in_num_fields; i++) {
-		if ((in_fields[i].check_value) && (in_fields[i].in_value)) {
+	for (int i = 0; i < in_num_fields; i++)
+	{
+		if ((in_fields[i].check_value) && (in_fields[i].in_value))
+		{
 			jtag_add_callback4(jtag_check_value_mask_callback,
-				(jtag_callback_data_t)in_fields[i].in_value,
-				(jtag_callback_data_t)in_fields[i].check_value,
-				(jtag_callback_data_t)in_fields[i].check_mask,
-				(jtag_callback_data_t)in_fields[i].num_bits);
+							   (jtag_callback_data_t)in_fields[i].in_value,
+							   (jtag_callback_data_t)in_fields[i].check_value,
+							   (jtag_callback_data_t)in_fields[i].check_mask,
+							   (jtag_callback_data_t)in_fields[i].num_bits);
 		}
 	}
 }
 
 void jtag_add_dr_scan_check(struct jtag_tap *active,
-	int in_num_fields,
-	struct scan_field *in_fields,
-	enum tap_state state)
+							int in_num_fields,
+							struct scan_field *in_fields,
+							enum tap_state state)
 {
 	if (jtag_verify)
 		jtag_add_scan_check(active, jtag_add_dr_scan, in_num_fields, in_fields, state);
@@ -434,11 +512,10 @@ void jtag_add_dr_scan_check(struct jtag_tap *active,
 		jtag_add_dr_scan(active, in_num_fields, in_fields, state);
 }
 
-
 void jtag_add_dr_scan(struct jtag_tap *active,
-	int in_num_fields,
-	const struct scan_field *in_fields,
-	enum tap_state state)
+					  int in_num_fields,
+					  const struct scan_field *in_fields,
+					  enum tap_state state)
 {
 	assert(state != TAP_RESET);
 
@@ -450,7 +527,7 @@ void jtag_add_dr_scan(struct jtag_tap *active,
 }
 
 void jtag_add_plain_dr_scan(int num_bits, const uint8_t *out_bits, uint8_t *in_bits,
-	enum tap_state state)
+							enum tap_state state)
 {
 	assert(out_bits);
 	assert(state != TAP_RESET);
@@ -510,22 +587,26 @@ void jtag_add_pathmove(unsigned int num_states, const enum tap_state *path)
 		return;
 
 	/* the last state has to be a stable state */
-	if (!tap_is_state_stable(path[num_states - 1])) {
+	if (!tap_is_state_stable(path[num_states - 1]))
+	{
 		LOG_ERROR("BUG: TAP path doesn't finish in a stable state");
 		jtag_set_error(ERROR_JTAG_NOT_STABLE_STATE);
 		return;
 	}
 
-	for (unsigned int i = 0; i < num_states; i++) {
-		if (path[i] == TAP_RESET) {
+	for (unsigned int i = 0; i < num_states; i++)
+	{
+		if (path[i] == TAP_RESET)
+		{
 			LOG_ERROR("BUG: TAP_RESET is not a valid state for pathmove sequences");
 			jtag_set_error(ERROR_JTAG_STATE_INVALID);
 			return;
 		}
 
-		if (!tap_is_state_next(cur_state, path[i])) {
+		if (!tap_is_state_next(cur_state, path[i]))
+		{
 			LOG_ERROR("BUG: %s -> %s isn't a valid TAP transition",
-				tap_state_name(cur_state), tap_state_name(path[i]));
+					  tap_state_name(cur_state), tap_state_name(path[i]));
 			jtag_set_error(ERROR_JTAG_TRANSITION_INVALID);
 			return;
 		}
@@ -542,10 +623,11 @@ int jtag_add_statemove(enum tap_state goal_state)
 {
 	enum tap_state cur_state = cmd_queue_cur_state;
 
-	if (goal_state != cur_state) {
+	if (goal_state != cur_state)
+	{
 		LOG_DEBUG("cur_state=%s goal_state=%s",
-			tap_state_name(cur_state),
-			tap_state_name(goal_state));
+				  tap_state_name(cur_state),
+				  tap_state_name(goal_state));
 	}
 
 	/* If goal is RESET, be paranoid and force that that transition
@@ -556,13 +638,15 @@ int jtag_add_statemove(enum tap_state goal_state)
 	else if (goal_state == cur_state)
 		/* nothing to do */;
 
-	else if (tap_is_state_stable(cur_state) && tap_is_state_stable(goal_state)) {
-		unsigned int tms_bits  = tap_get_tms_path(cur_state, goal_state);
+	else if (tap_is_state_stable(cur_state) && tap_is_state_stable(goal_state))
+	{
+		unsigned int tms_bits = tap_get_tms_path(cur_state, goal_state);
 		unsigned int tms_count = tap_get_tms_path_len(cur_state, goal_state);
 		enum tap_state moves[8];
 		assert(tms_count < ARRAY_SIZE(moves));
 
-		for (unsigned int i = 0; i < tms_count; i++, tms_bits >>= 1) {
+		for (unsigned int i = 0; i < tms_count; i++, tms_bits >>= 1)
+		{
 			bool bit = tms_bits & 1;
 
 			cur_state = tap_state_transition(cur_state, bit);
@@ -570,7 +654,8 @@ int jtag_add_statemove(enum tap_state goal_state)
 		}
 
 		jtag_add_pathmove(tms_count, moves);
-	} else if (tap_is_state_next(cur_state, goal_state))
+	}
+	else if (tap_is_state_next(cur_state, goal_state))
 		jtag_add_pathmove(1, &goal_state);
 	else
 		return ERROR_FAIL;
@@ -584,17 +669,18 @@ void jtag_add_runtest(unsigned int num_cycles, enum tap_state state)
 	jtag_set_error(interface_jtag_add_runtest(num_cycles, state));
 }
 
-
 void jtag_add_clocks(unsigned int num_cycles)
 {
-	if (!tap_is_state_stable(cmd_queue_cur_state)) {
+	if (!tap_is_state_stable(cmd_queue_cur_state))
+	{
 		LOG_ERROR("jtag_add_clocks() called with TAP in unstable state \"%s\"",
-			tap_state_name(cmd_queue_cur_state));
+				  tap_state_name(cmd_queue_cur_state));
 		jtag_set_error(ERROR_JTAG_NOT_STABLE_STATE);
 		return;
 	}
 
-	if (num_cycles > 0) {
+	if (num_cycles > 0)
+	{
 		jtag_checks();
 		jtag_set_error(interface_jtag_add_clocks(num_cycles));
 	}
@@ -604,8 +690,10 @@ static int adapter_system_reset(int req_srst)
 {
 	int retval;
 
-	if (req_srst) {
-		if (!(jtag_reset_config & RESET_HAS_SRST)) {
+	if (req_srst)
+	{
+		if (!(jtag_reset_config & RESET_HAS_SRST))
+		{
 			LOG_ERROR("BUG: can't assert SRST");
 			return ERROR_FAIL;
 		}
@@ -613,8 +701,10 @@ static int adapter_system_reset(int req_srst)
 	}
 
 	/* Maybe change SRST signal state */
-	if (jtag_srst != req_srst) {
-		if (!adapter_driver->reset) {
+	if (jtag_srst != req_srst)
+	{
+		if (!adapter_driver->reset)
+		{
 			if (req_srst)
 				LOG_ERROR("Adapter driver does not implement SRST handling");
 
@@ -622,17 +712,21 @@ static int adapter_system_reset(int req_srst)
 		}
 
 		retval = adapter_driver->reset(0, req_srst);
-		if (retval != ERROR_OK) {
+		if (retval != ERROR_OK)
+		{
 			LOG_ERROR("SRST error");
 			return ERROR_FAIL;
 		}
 		jtag_srst = req_srst;
 
-		if (req_srst) {
+		if (req_srst)
+		{
 			LOG_DEBUG("SRST line asserted");
 			if (adapter_nsrst_assert_width)
 				jtag_sleep(adapter_nsrst_assert_width * 1000);
-		} else {
+		}
+		else
+		{
 			LOG_DEBUG("SRST line released");
 			if (adapter_nsrst_delay)
 				jtag_sleep(adapter_nsrst_delay * 1000);
@@ -655,14 +749,16 @@ static void legacy_jtag_add_reset(int req_tlr_or_trst, int req_srst)
 	 * RESET_SRST_PULLS_TRST is a board or chip level quirk, which
 	 * can kick in even if the JTAG adapter can't drive TRST.
 	 */
-	if (req_srst) {
-		if (!(jtag_reset_config & RESET_HAS_SRST)) {
+	if (req_srst)
+	{
+		if (!(jtag_reset_config & RESET_HAS_SRST))
+		{
 			LOG_ERROR("BUG: can't assert SRST");
 			jtag_set_error(ERROR_FAIL);
 			return;
 		}
-		if ((jtag_reset_config & RESET_SRST_PULLS_TRST) != 0
-				&& !req_tlr_or_trst) {
+		if ((jtag_reset_config & RESET_SRST_PULLS_TRST) != 0 && !req_tlr_or_trst)
+		{
 			LOG_ERROR("BUG: can't assert only SRST");
 			jtag_set_error(ERROR_FAIL);
 			return;
@@ -677,18 +773,19 @@ static void legacy_jtag_add_reset(int req_tlr_or_trst, int req_srst)
 	 * RESET_TRST_PULLS_SRST is a board or chip level quirk, which
 	 * can kick in even if the JTAG adapter can't drive SRST.
 	 */
-	if (req_tlr_or_trst) {
+	if (req_tlr_or_trst)
+	{
 		if (!(jtag_reset_config & RESET_HAS_TRST))
 			trst_with_tlr = 1;
-		else if ((jtag_reset_config & RESET_TRST_PULLS_SRST) != 0
-			 && !req_srst)
+		else if ((jtag_reset_config & RESET_TRST_PULLS_SRST) != 0 && !req_srst)
 			trst_with_tlr = 1;
 		else
 			new_trst = 1;
 	}
 
 	/* Maybe change TRST and/or SRST signal state */
-	if (jtag_srst != new_srst || jtag_trst != new_trst) {
+	if (jtag_srst != new_srst || jtag_trst != new_trst)
+	{
 		int retval;
 
 		retval = interface_jtag_add_reset(new_trst, new_srst);
@@ -697,20 +794,25 @@ static void legacy_jtag_add_reset(int req_tlr_or_trst, int req_srst)
 		else
 			retval = jtag_execute_queue();
 
-		if (retval != ERROR_OK) {
+		if (retval != ERROR_OK)
+		{
 			LOG_ERROR("TRST/SRST error");
 			return;
 		}
 	}
 
 	/* SRST resets everything hooked up to that signal */
-	if (jtag_srst != new_srst) {
+	if (jtag_srst != new_srst)
+	{
 		jtag_srst = new_srst;
-		if (jtag_srst) {
+		if (jtag_srst)
+		{
 			LOG_DEBUG("SRST line asserted");
 			if (adapter_nsrst_assert_width)
 				jtag_add_sleep(adapter_nsrst_assert_width * 1000);
-		} else {
+		}
+		else
+		{
 			LOG_DEBUG("SRST line released");
 			if (adapter_nsrst_delay)
 				jtag_add_sleep(adapter_nsrst_delay * 1000);
@@ -723,18 +825,23 @@ static void legacy_jtag_add_reset(int req_tlr_or_trst, int req_srst)
 	 *
 	 * TAP_RESET should be invisible to non-debug parts of the system.
 	 */
-	if (trst_with_tlr) {
+	if (trst_with_tlr)
+	{
 		LOG_DEBUG("JTAG reset with TLR instead of TRST");
 		jtag_add_tlr();
-
-	} else if (jtag_trst != new_trst) {
+	}
+	else if (jtag_trst != new_trst)
+	{
 		jtag_trst = new_trst;
-		if (jtag_trst) {
+		if (jtag_trst)
+		{
 			LOG_DEBUG("TRST line asserted");
 			tap_set_state(TAP_RESET);
 			if (jtag_ntrst_assert_width)
 				jtag_add_sleep(jtag_ntrst_assert_width * 1000);
-		} else {
+		}
+		else
+		{
 			LOG_DEBUG("TRST line released");
 			if (jtag_ntrst_delay)
 				jtag_add_sleep(jtag_ntrst_delay * 1000);
@@ -758,7 +865,8 @@ void jtag_add_reset(int req_tlr_or_trst, int req_srst)
 	int new_srst = 0;
 	int new_trst = 0;
 
-	if (!adapter_driver->reset) {
+	if (!adapter_driver->reset)
+	{
 		legacy_jtag_add_reset(req_tlr_or_trst, req_srst);
 		return;
 	}
@@ -770,14 +878,16 @@ void jtag_add_reset(int req_tlr_or_trst, int req_srst)
 	 * RESET_SRST_PULLS_TRST is a board or chip level quirk, which
 	 * can kick in even if the JTAG adapter can't drive TRST.
 	 */
-	if (req_srst) {
-		if (!(jtag_reset_config & RESET_HAS_SRST)) {
+	if (req_srst)
+	{
+		if (!(jtag_reset_config & RESET_HAS_SRST))
+		{
 			LOG_ERROR("BUG: can't assert SRST");
 			jtag_set_error(ERROR_FAIL);
 			return;
 		}
-		if ((jtag_reset_config & RESET_SRST_PULLS_TRST) != 0
-				&& !req_tlr_or_trst) {
+		if ((jtag_reset_config & RESET_SRST_PULLS_TRST) != 0 && !req_tlr_or_trst)
+		{
 			LOG_ERROR("BUG: can't assert only SRST");
 			jtag_set_error(ERROR_FAIL);
 			return;
@@ -792,23 +902,25 @@ void jtag_add_reset(int req_tlr_or_trst, int req_srst)
 	 * RESET_TRST_PULLS_SRST is a board or chip level quirk, which
 	 * can kick in even if the JTAG adapter can't drive SRST.
 	 */
-	if (req_tlr_or_trst) {
+	if (req_tlr_or_trst)
+	{
 		if (!(jtag_reset_config & RESET_HAS_TRST))
 			trst_with_tlr = 1;
-		else if ((jtag_reset_config & RESET_TRST_PULLS_SRST) != 0
-			 && !req_srst)
+		else if ((jtag_reset_config & RESET_TRST_PULLS_SRST) != 0 && !req_srst)
 			trst_with_tlr = 1;
 		else
 			new_trst = 1;
 	}
 
 	/* Maybe change TRST and/or SRST signal state */
-	if (jtag_srst != new_srst || jtag_trst != new_trst) {
+	if (jtag_srst != new_srst || jtag_trst != new_trst)
+	{
 		/* guarantee jtag queue empty before changing reset status */
 		jtag_execute_queue();
 
 		retval = adapter_driver->reset(new_trst, new_srst);
-		if (retval != ERROR_OK) {
+		if (retval != ERROR_OK)
+		{
 			jtag_set_error(retval);
 			LOG_ERROR("TRST/SRST error");
 			return;
@@ -816,13 +928,17 @@ void jtag_add_reset(int req_tlr_or_trst, int req_srst)
 	}
 
 	/* SRST resets everything hooked up to that signal */
-	if (jtag_srst != new_srst) {
+	if (jtag_srst != new_srst)
+	{
 		jtag_srst = new_srst;
-		if (jtag_srst) {
+		if (jtag_srst)
+		{
 			LOG_DEBUG("SRST line asserted");
 			if (adapter_nsrst_assert_width)
 				jtag_add_sleep(adapter_nsrst_assert_width * 1000);
-		} else {
+		}
+		else
+		{
 			LOG_DEBUG("SRST line released");
 			if (adapter_nsrst_delay)
 				jtag_add_sleep(adapter_nsrst_delay * 1000);
@@ -835,19 +951,24 @@ void jtag_add_reset(int req_tlr_or_trst, int req_srst)
 	 *
 	 * TAP_RESET should be invisible to non-debug parts of the system.
 	 */
-	if (trst_with_tlr) {
+	if (trst_with_tlr)
+	{
 		LOG_DEBUG("JTAG reset with TLR instead of TRST");
 		jtag_add_tlr();
 		jtag_execute_queue();
-
-	} else if (jtag_trst != new_trst) {
+	}
+	else if (jtag_trst != new_trst)
+	{
 		jtag_trst = new_trst;
-		if (jtag_trst) {
+		if (jtag_trst)
+		{
 			LOG_DEBUG("TRST line asserted");
 			tap_set_state(TAP_RESET);
 			if (jtag_ntrst_assert_width)
 				jtag_add_sleep(jtag_ntrst_assert_width * 1000);
-		} else {
+		}
+		else
+		{
 			LOG_DEBUG("TRST line released");
 			if (jtag_ntrst_delay)
 				jtag_add_sleep(jtag_ntrst_delay * 1000);
@@ -871,7 +992,7 @@ void jtag_add_sleep(uint32_t us)
 }
 
 static int jtag_check_value_inner(uint8_t *captured, uint8_t *in_check_value,
-	uint8_t *in_check_mask, int num_bits)
+								  uint8_t *in_check_mask, int num_bits)
 {
 	int retval = ERROR_OK;
 	int compare_failed;
@@ -881,7 +1002,8 @@ static int jtag_check_value_inner(uint8_t *captured, uint8_t *in_check_value,
 	else
 		compare_failed = !buf_eq(captured, in_check_value, num_bits);
 
-	if (compare_failed) {
+	if (compare_failed)
+	{
 		char *captured_str, *in_check_value_str;
 		int bits = (num_bits > DEBUG_JTAG_IOZ) ? DEBUG_JTAG_IOZ : num_bits;
 
@@ -891,13 +1013,14 @@ static int jtag_check_value_inner(uint8_t *captured, uint8_t *in_check_value,
 		in_check_value_str = buf_to_hex_str(in_check_value, bits);
 
 		LOG_WARNING("Bad value '%s' captured during DR or IR scan:",
-			captured_str);
+					captured_str);
 		LOG_WARNING(" check_value: 0x%s", in_check_value_str);
 
 		free(captured_str);
 		free(in_check_value_str);
 
-		if (in_check_mask) {
+		if (in_check_mask)
+		{
 			char *in_check_mask_str;
 
 			in_check_mask_str = buf_to_hex_str(in_check_mask, bits);
@@ -914,7 +1037,8 @@ void jtag_check_value_mask(struct scan_field *field, uint8_t *value, uint8_t *ma
 {
 	assert(field->in_value);
 
-	if (!value) {
+	if (!value)
+	{
 		/* no checking to do */
 		return;
 	}
@@ -927,14 +1051,16 @@ void jtag_check_value_mask(struct scan_field *field, uint8_t *value, uint8_t *ma
 
 int default_interface_jtag_execute_queue(void)
 {
-	if (!is_adapter_initialized()) {
+	if (!is_adapter_initialized())
+	{
 		LOG_ERROR("No JTAG interface configured yet.  "
-			"Issue 'init' command in startup scripts "
-			"before communicating with targets.");
+				  "Issue 'init' command in startup scripts "
+				  "before communicating with targets.");
 		return ERROR_FAIL;
 	}
 
-	if (!transport_is_jtag()) {
+	if (!transport_is_jtag())
+	{
 		/*
 		 * FIXME: This should not happen!
 		 * There could be old code that queues jtag commands with non jtag interfaces so, for
@@ -950,20 +1076,25 @@ int default_interface_jtag_execute_queue(void)
 	struct jtag_command *cmd = jtag_command_queue_get();
 	int result = adapter_driver->jtag_ops->execute_queue(cmd);
 
-	while (LOG_LEVEL_IS(LOG_LVL_DEBUG_IO) && cmd) {
-		switch (cmd->type) {
+	while (LOG_LEVEL_IS(LOG_LVL_DEBUG_IO) && cmd)
+	{
+		switch (cmd->type)
+		{
 		case JTAG_SCAN:
 			LOG_DEBUG_IO("JTAG %s SCAN to %s",
-					cmd->cmd.scan->ir_scan ? "IR" : "DR",
-					tap_state_name(cmd->cmd.scan->end_state));
-			for (unsigned int i = 0; i < cmd->cmd.scan->num_fields; i++) {
+						 cmd->cmd.scan->ir_scan ? "IR" : "DR",
+						 tap_state_name(cmd->cmd.scan->end_state));
+			for (unsigned int i = 0; i < cmd->cmd.scan->num_fields; i++)
+			{
 				struct scan_field *field = cmd->cmd.scan->fields + i;
-				if (field->out_value) {
+				if (field->out_value)
+				{
 					char *str = buf_to_hex_str(field->out_value, field->num_bits);
 					LOG_DEBUG_IO("  %ub out: %s", field->num_bits, str);
 					free(str);
 				}
-				if (field->in_value) {
+				if (field->in_value)
+				{
 					char *str = buf_to_hex_str(field->in_value, field->num_bits);
 					LOG_DEBUG_IO("  %ub  in: %s", field->num_bits, str);
 					free(str);
@@ -972,23 +1103,22 @@ int default_interface_jtag_execute_queue(void)
 			break;
 		case JTAG_TLR_RESET:
 			LOG_DEBUG_IO("JTAG TLR RESET to %s",
-					tap_state_name(cmd->cmd.statemove->end_state));
+						 tap_state_name(cmd->cmd.statemove->end_state));
 			break;
 		case JTAG_RUNTEST:
 			LOG_DEBUG_IO("JTAG RUNTEST %d cycles to %s",
-					cmd->cmd.runtest->num_cycles,
-					tap_state_name(cmd->cmd.runtest->end_state));
+						 cmd->cmd.runtest->num_cycles,
+						 tap_state_name(cmd->cmd.runtest->end_state));
 			break;
 		case JTAG_RESET:
-			{
-				const char *reset_str[3] = {
-					"leave", "deassert", "assert"
-				};
-				LOG_DEBUG_IO("JTAG RESET %s TRST, %s SRST",
-						reset_str[cmd->cmd.reset->trst + 1],
-						reset_str[cmd->cmd.reset->srst + 1]);
-			}
-			break;
+		{
+			const char *reset_str[3] = {
+				"leave", "deassert", "assert"};
+			LOG_DEBUG_IO("JTAG RESET %s TRST, %s SRST",
+						 reset_str[cmd->cmd.reset->trst + 1],
+						 reset_str[cmd->cmd.reset->srst + 1]);
+		}
+		break;
 		case JTAG_PATHMOVE:
 			LOG_DEBUG_IO("JTAG PATHMOVE (TODO)");
 			break;
@@ -1016,7 +1146,8 @@ void jtag_execute_queue_noclear(void)
 	jtag_flush_queue_count++;
 	jtag_set_error(interface_jtag_execute_queue());
 
-	if (jtag_flush_queue_sleep > 0) {
+	if (jtag_flush_queue_sleep > 0)
+	{
 		/* For debug purposes it can be useful to test performance
 		 * or behavior when delaying after flushing the queue,
 		 * e.g. to simulate long roundtrip times.
@@ -1040,7 +1171,8 @@ static int jtag_reset_callback(enum jtag_event event, void *priv)
 {
 	struct jtag_tap *tap = priv;
 
-	if (event == JTAG_TRST_ASSERTED) {
+	if (event == JTAG_TRST_ASSERTED)
+	{
 		tap->enabled = !tap->disabled_after_reset;
 
 		/* current instruction is either BYPASS or IDCODE */
@@ -1060,22 +1192,22 @@ void jtag_sleep(uint32_t us)
 	if (us < 1000)
 		usleep(us);
 	else
-		alive_sleep((us+999)/1000);
+		alive_sleep((us + 999) / 1000);
 }
 
 #define JTAG_MAX_AUTO_TAPS 20
 
-#define EXTRACT_MFG(X)  (((X) & 0xffe) >> 1)
+#define EXTRACT_MFG(X) (((X) & 0xffe) >> 1)
 #define EXTRACT_PART(X) (((X) & 0xffff000) >> 12)
-#define EXTRACT_VER(X)  (((X) & 0xf0000000) >> 28)
+#define EXTRACT_VER(X) (((X) & 0xf0000000) >> 28)
 
 /* A reserved manufacturer ID is used in END_OF_CHAIN_FLAG, so we
  * know that no valid TAP will have it as an IDCODE value.
  */
-#define END_OF_CHAIN_FLAG       0xffffffff
+#define END_OF_CHAIN_FLAG 0xffffffff
 
 /* a larger IR length than we ever expect to autoprobe */
-#define JTAG_IRLEN_MAX          60
+#define JTAG_IRLEN_MAX 60
 
 static int jtag_examine_chain_execute(uint8_t *idcode_buffer, unsigned int num_idcode)
 {
@@ -1099,7 +1231,8 @@ static bool jtag_examine_chain_check(uint8_t *idcodes, unsigned int count)
 	uint8_t zero_check = 0x0;
 	uint8_t one_check = 0xff;
 
-	for (unsigned int i = 0; i < count * 4; i++) {
+	for (unsigned int i = 0; i < count * 4; i++)
+	{
 		zero_check |= idcodes[i];
 		one_check &= idcodes[i];
 	}
@@ -1114,9 +1247,10 @@ static bool jtag_examine_chain_check(uint8_t *idcodes, unsigned int count)
 	 *     + there are several hundreds of TAPs in bypass, or
 	 *     + at least a few dozen TAPs all have an all-ones IDCODE
 	 */
-	if (zero_check == 0x00 || one_check == 0xff) {
+	if (zero_check == 0x00 || one_check == 0xff)
+	{
 		LOG_ERROR("JTAG scan chain interrogation failed: all %s",
-			(zero_check == 0x00) ? "zeroes" : "ones");
+				  (zero_check == 0x00) ? "zeroes" : "ones");
 		LOG_ERROR("Check JTAG interface, timings, target power, etc.");
 		return false;
 	}
@@ -1124,17 +1258,17 @@ static bool jtag_examine_chain_check(uint8_t *idcodes, unsigned int count)
 }
 
 static void jtag_examine_chain_display(enum log_levels level, const char *msg,
-	const char *name, uint32_t idcode)
+									   const char *name, uint32_t idcode)
 {
 	log_printf_lf(level, __FILE__, __LINE__, __func__,
-		"JTAG tap: %s %16.16s: 0x%08x "
-		"(mfg: 0x%3.3x (%s), part: 0x%4.4x, ver: 0x%1.1x)",
-		name, msg,
-		(unsigned int)idcode,
-		(unsigned int)EXTRACT_MFG(idcode),
-		jep106_manufacturer(EXTRACT_MFG(idcode)),
-		(unsigned int)EXTRACT_PART(idcode),
-		(unsigned int)EXTRACT_VER(idcode));
+				  "JTAG tap: %s %16.16s: 0x%08x "
+				  "(mfg: 0x%3.3x (%s), part: 0x%4.4x, ver: 0x%1.1x)",
+				  name, msg,
+				  (unsigned int)idcode,
+				  (unsigned int)EXTRACT_MFG(idcode),
+				  jep106_manufacturer(EXTRACT_MFG(idcode)),
+				  (unsigned int)EXTRACT_PART(idcode),
+				  (unsigned int)EXTRACT_VER(idcode));
 }
 
 static bool jtag_idcode_is_final(uint32_t idcode)
@@ -1155,17 +1289,18 @@ static bool jtag_idcode_is_final(uint32_t idcode)
  * Returns TRUE iff garbage was found.
  */
 static bool jtag_examine_chain_end(uint8_t *idcodes, unsigned int count,
-	unsigned int max)
+								   unsigned int max)
 {
 	bool triggered = false;
-	for (; count < max - 31; count += 32) {
+	for (; count < max - 31; count += 32)
+	{
 		uint32_t idcode = buf_get_u32(idcodes, count, 32);
 
 		/* do not trigger the warning if the data looks good */
 		if (jtag_idcode_is_final(idcode))
 			continue;
 		LOG_WARNING("Unexpected idcode after end of chain: %d 0x%08x",
-			count, (unsigned int)idcode);
+					count, (unsigned int)idcode);
 		triggered = true;
 	}
 	return triggered;
@@ -1182,7 +1317,8 @@ static bool jtag_examine_chain_match_tap(const struct jtag_tap *tap)
 	uint32_t idcode = tap->idcode & mask;
 
 	/* Loop over the expected identification codes and test for a match */
-	for (unsigned int i = 0; i < tap->expected_ids_cnt; i++) {
+	for (unsigned int i = 0; i < tap->expected_ids_cnt; i++)
+	{
 		uint32_t expected = tap->expected_ids[i] & mask;
 
 		if (idcode == expected)
@@ -1195,13 +1331,14 @@ static bool jtag_examine_chain_match_tap(const struct jtag_tap *tap)
 
 	/* If none of the expected ids matched, warn */
 	jtag_examine_chain_display(LOG_LVL_WARNING, "UNEXPECTED",
-		tap->dotted_name, tap->idcode);
-	for (unsigned int i = 0; i < tap->expected_ids_cnt; i++) {
+							   tap->dotted_name, tap->idcode);
+	for (unsigned int i = 0; i < tap->expected_ids_cnt; i++)
+	{
 		char msg[32];
 
 		snprintf(msg, sizeof(msg), "expected %u of %u", i + 1, tap->expected_ids_cnt);
 		jtag_examine_chain_display(LOG_LVL_ERROR, msg,
-			tap->dotted_name, tap->expected_ids[i]);
+								   tap->dotted_name, tap->expected_ids[i]);
 	}
 	return false;
 }
@@ -1211,6 +1348,13 @@ static bool jtag_examine_chain_match_tap(const struct jtag_tap *tap)
  */
 static int jtag_examine_chain(void)
 {
+	struct jtagcore_overwrite *record = jtagcore_get_overwrite_record();
+	if (record->jtag_examine_chain)
+	{
+		LOG_DEBUG("Running overwrite routine for jtag_examine_chain()");
+		return record->jtag_examine_chain();
+	}
+
 	int retval;
 	unsigned int max_taps = jtag_tap_count();
 
@@ -1232,7 +1376,8 @@ static int jtag_examine_chain(void)
 	retval = jtag_examine_chain_execute(idcode_buffer, max_taps);
 	if (retval != ERROR_OK)
 		goto out;
-	if (!jtag_examine_chain_check(idcode_buffer, max_taps)) {
+	if (!jtag_examine_chain_check(idcode_buffer, max_taps))
+	{
 		retval = ERROR_JTAG_INIT_FAILED;
 		goto out;
 	}
@@ -1242,12 +1387,14 @@ static int jtag_examine_chain(void)
 
 	unsigned int bit_count = 0;
 	unsigned int autocount = 0;
-	for (unsigned int i = 0; i < max_taps; i++) {
+	for (unsigned int i = 0; i < max_taps; i++)
+	{
 		assert(bit_count < max_taps * 32);
 		uint32_t idcode = buf_get_u32(idcode_buffer, bit_count, 32);
 
 		/* No predefined TAP? Auto-probe. */
-		if (!tap) {
+		if (!tap)
+		{
 			/* Is there another TAP? */
 			if (jtag_idcode_is_final(idcode))
 				break;
@@ -1258,7 +1405,8 @@ static int jtag_examine_chain(void)
 			 * share it with jim_newtap_cmd().
 			 */
 			tap = calloc(1, sizeof(*tap));
-			if (!tap) {
+			if (!tap)
+			{
 				retval = ERROR_FAIL;
 				goto out;
 			}
@@ -1276,15 +1424,18 @@ static int jtag_examine_chain(void)
 			jtag_tap_init(tap);
 		}
 
-		if ((idcode & 1) == 0 && !tap->ignore_bypass) {
+		if ((idcode & 1) == 0 && !tap->ignore_bypass)
+		{
 			/* Zero for LSB indicates a device in bypass */
 			LOG_INFO("TAP %s does not have valid IDCODE (idcode=0x%" PRIx32 ")",
-					tap->dotted_name, idcode);
+					 tap->dotted_name, idcode);
 			tap->has_idcode = false;
 			tap->idcode = 0;
 
 			bit_count += 1;
-		} else {
+		}
+		else
+		{
 			/* Friendly devices support IDCODE */
 			tap->has_idcode = true;
 			tap->idcode = idcode;
@@ -1303,7 +1454,8 @@ static int jtag_examine_chain(void)
 	/* After those IDCODE or BYPASS register values should be
 	 * only the data we fed into the scan chain.
 	 */
-	if (jtag_examine_chain_end(idcode_buffer, bit_count, max_taps * 32)) {
+	if (jtag_examine_chain_end(idcode_buffer, bit_count, max_taps * 32))
+	{
 		LOG_ERROR("double-check your JTAG setup (interface, speed, ...)");
 		retval = ERROR_JTAG_INIT_FAILED;
 		goto out;
@@ -1327,6 +1479,13 @@ out:
  */
 static int jtag_validate_ircapture(void)
 {
+	struct jtagcore_overwrite *record = jtagcore_get_overwrite_record();
+	if (record->jtag_validate_ircapture)
+	{
+		LOG_DEBUG("Running overwrite routine for jtag_validate_ircapture()");
+		return record->jtag_validate_ircapture();
+	}
+
 	struct jtag_tap *tap;
 	uint8_t *ir_test = NULL;
 	struct scan_field field;
@@ -1335,7 +1494,8 @@ static int jtag_validate_ircapture(void)
 
 	/* when autoprobing, accommodate huge IR lengths */
 	unsigned int total_ir_length = 0;
-	for (tap = jtag_tap_next_enabled(NULL); tap; tap = jtag_tap_next_enabled(tap)) {
+	for (tap = jtag_tap_next_enabled(NULL); tap; tap = jtag_tap_next_enabled(tap))
+	{
 		if (tap->ir_length == 0)
 			total_ir_length += JTAG_IRLEN_MAX;
 		else
@@ -1366,7 +1526,8 @@ static int jtag_validate_ircapture(void)
 	tap = NULL;
 	chain_pos = 0;
 
-	for (;; ) {
+	for (;;)
+	{
 		tap = jtag_tap_next_enabled(tap);
 		if (!tap)
 			break;
@@ -1387,15 +1548,16 @@ static int jtag_validate_ircapture(void)
 		 * which could provide more knowledge, based on IDCODE; and
 		 * only guess when that has no success.
 		 */
-		if (tap->ir_length == 0) {
+		if (tap->ir_length == 0)
+		{
 			tap->ir_length = 2;
-			while (buf_get_u64(ir_test, chain_pos, tap->ir_length + 1) == 1
-					&& tap->ir_length < JTAG_IRLEN_MAX) {
+			while (buf_get_u64(ir_test, chain_pos, tap->ir_length + 1) == 1 && tap->ir_length < JTAG_IRLEN_MAX)
+			{
 				tap->ir_length++;
 			}
 			LOG_WARNING("AUTO %s - use \"jtag newtap %s %s -irlen %u "
-					"-expected-id 0x%08" PRIx32 "\"",
-					tap->dotted_name, tap->chip, tap->tapname, tap->ir_length, tap->idcode);
+						"-expected-id 0x%08" PRIx32 "\"",
+						tap->dotted_name, tap->chip, tap->tapname, tap->ir_length, tap->idcode);
 		}
 
 		/* Validate the two LSBs, which must be 01 per JTAG spec.
@@ -1406,41 +1568,48 @@ static int jtag_validate_ircapture(void)
 		 * attributes might disable this test.
 		 */
 		uint64_t val = buf_get_u64(ir_test, chain_pos, tap->ir_length);
-		if ((val & tap->ir_capture_mask) != tap->ir_capture_value) {
+		if ((val & tap->ir_capture_mask) != tap->ir_capture_value)
+		{
 			LOG_ERROR("%s: IR capture error; saw 0x%0*" PRIx64 " not 0x%0*" PRIx32,
-				jtag_tap_name(tap),
-				(tap->ir_length + 7) / tap->ir_length, val,
-				(tap->ir_length + 7) / tap->ir_length, tap->ir_capture_value);
+					  jtag_tap_name(tap),
+					  (tap->ir_length + 7) / tap->ir_length, val,
+					  (tap->ir_length + 7) / tap->ir_length, tap->ir_capture_value);
 
 			retval = ERROR_JTAG_INIT_FAILED;
 			goto done;
 		}
 		LOG_DEBUG("%s: IR capture 0x%0*" PRIx64, jtag_tap_name(tap),
-			(tap->ir_length + 7) / tap->ir_length, val);
+				  (tap->ir_length + 7) / tap->ir_length, val);
 		chain_pos += tap->ir_length;
 	}
 
 	/* verify the '11' sentinel we wrote is returned at the end */
 	uint64_t val = buf_get_u64(ir_test, chain_pos, 2);
-	if (val != 0x3) {
+	if (val != 0x3)
+	{
 		char *cbuf = buf_to_hex_str(ir_test, total_ir_length);
 
 		LOG_ERROR("IR capture error at bit %d, saw 0x%s not 0x...3",
-			chain_pos, cbuf);
+				  chain_pos, cbuf);
 		free(cbuf);
 		retval = ERROR_JTAG_INIT_FAILED;
 	}
 
 done:
 	free(ir_test);
-	if (retval != ERROR_OK) {
+	if (retval != ERROR_OK)
+	{
 		jtag_add_tlr();
 		jtag_execute_queue();
 	}
 	return retval;
 }
 
-void jtag_tap_init(struct jtag_tap *tap)
+/**
+ * Initilaize JTAG Tap.
+ * @note Will not fill in \c chip, \c tapname and \c dottedname.
+ */
+void jtag_tap_init_only(struct jtag_tap *tap)
 {
 	unsigned int ir_len_bits;
 	unsigned int ir_len_bytes;
@@ -1466,20 +1635,38 @@ void jtag_tap_init(struct jtag_tap *tap)
 
 	/* register the reset callback for the TAP */
 	jtag_register_event_callback(&jtag_reset_callback, tap);
+
+	tap->hardware = NULL;
+}
+
+/**
+ * Initilaize JTAG Tap.
+ * @note Will not fill in \c chip, \c tapname and \c dottedname.
+ */
+void jtag_tap_init(struct jtag_tap *tap)
+{
+	jtag_tap_init_only(tap);
 	jtag_tap_add(tap);
 
 	LOG_DEBUG("Created Tap: %s @ abs position %u, "
-			"irlen %u, capture: 0x%" PRIx32 " mask: 0x%" PRIx32, tap->dotted_name,
-			tap->abs_chain_position, tap->ir_length,
-			tap->ir_capture_value, tap->ir_capture_mask);
+			  "irlen %u, capture: 0x%" PRIx32 " mask: 0x%" PRIx32,
+			  tap->dotted_name,
+			  tap->abs_chain_position, tap->ir_length,
+			  tap->ir_capture_value, tap->ir_capture_mask);
 }
 
 void jtag_tap_free(struct jtag_tap *tap)
 {
+	if (tap->hardware)
+	{
+		free(tap->hardware);
+	}
+
 	jtag_unregister_event_callback(&jtag_reset_callback, tap);
 
 	struct jtag_tap_event_action *jteap = tap->event_action;
-	while (jteap) {
+	while (jteap)
+	{
 		struct jtag_tap_event_action *next = jteap->next;
 		Jim_DecrRefCount(jteap->interp, jteap->body);
 		free(jteap);
@@ -1505,7 +1692,8 @@ int jtag_init_inner(struct command_context *cmd_ctx)
 	LOG_DEBUG("Init JTAG chain");
 
 	tap = jtag_tap_next_enabled(NULL);
-	if (!tap) {
+	if (!tap)
+	{
 		/* Once JTAG itself is properly set up, and the scan chain
 		 * isn't absurdly large, IDCODE autoprobe should work fine.
 		 *
@@ -1518,7 +1706,7 @@ int jtag_init_inner(struct command_context *cmd_ctx)
 		 * the TAP's IDCODE values.
 		 */
 		LOG_WARNING("There are no enabled taps.  "
-			"AUTO PROBING MIGHT NOT WORK!!");
+					"AUTO PROBING MIGHT NOT WORK!!");
 
 		/* REVISIT default clock will often be too fast ... */
 	}
@@ -1533,7 +1721,8 @@ int jtag_init_inner(struct command_context *cmd_ctx)
 	 * configuring the wrong number of (enabled) TAPs.
 	 */
 	retval = jtag_examine_chain();
-	switch (retval) {
+	switch (retval)
+	{
 	case ERROR_OK:
 		/* complete success */
 		break;
@@ -1559,7 +1748,8 @@ int jtag_init_inner(struct command_context *cmd_ctx)
 	 * ircapture/irmask values during TAP setup.)
 	 */
 	retval = jtag_validate_ircapture();
-	if (retval != ERROR_OK) {
+	if (retval != ERROR_OK)
+	{
 		/* The target might be powered down. The user
 		 * can power it up and reset it after firing
 		 * up OpenOCD.
@@ -1571,7 +1761,6 @@ int jtag_init_inner(struct command_context *cmd_ctx)
 		jtag_notify_event(JTAG_TAP_EVENT_SETUP);
 	else
 		LOG_WARNING("Bypassing JTAG setup events due to errors");
-
 
 	return ERROR_OK;
 }
@@ -1625,23 +1814,29 @@ int jtag_init_reset(struct command_context *cmd_ctx)
 	 * REVISIT once Tcl code can read the reset_config modes, this won't
 	 * need to be a C routine at all...
 	 */
-	if (jtag_reset_config & RESET_HAS_SRST) {
+	if (jtag_reset_config & RESET_HAS_SRST)
+	{
 		jtag_add_reset(1, 1);
 		if ((jtag_reset_config & RESET_SRST_PULLS_TRST) == 0)
 			jtag_add_reset(0, 1);
-	} else {
-		jtag_add_reset(1, 0);	/* TAP_RESET, using TMS+TCK or TRST */
+	}
+	else
+	{
+		jtag_add_reset(1, 0); /* TAP_RESET, using TMS+TCK or TRST */
 	}
 
 	/* some targets enable us to connect with srst asserted */
-	if (jtag_reset_config & RESET_CNCT_UNDER_SRST) {
+	if (jtag_reset_config & RESET_CNCT_UNDER_SRST)
+	{
 		if (jtag_reset_config & RESET_SRST_NO_GATING)
 			jtag_add_reset(0, 1);
-		else {
+		else
+		{
 			LOG_WARNING("\'srst_nogate\' reset_config option is required");
 			jtag_add_reset(0, 0);
 		}
-	} else
+	}
+	else
 		jtag_add_reset(0, 0);
 	retval = jtag_execute_queue();
 	if (retval != ERROR_OK)
@@ -1667,7 +1862,8 @@ int jtag_init(struct command_context *cmd_ctx)
 	jtag_add_reset(0, 0);
 
 	/* some targets enable us to connect with srst asserted */
-	if (jtag_reset_config & RESET_CNCT_UNDER_SRST) {
+	if (jtag_reset_config & RESET_CNCT_UNDER_SRST)
+	{
 		if (jtag_reset_config & RESET_SRST_NO_GATING)
 			jtag_add_reset(0, 1);
 		else
@@ -1705,7 +1901,8 @@ bool jtag_will_verify_capture_ir(void)
 
 int jtag_power_dropout(int *dropout)
 {
-	if (!is_adapter_initialized()) {
+	if (!is_adapter_initialized())
+	{
 		/* TODO: as the jtag interface is not valid all
 		 * we can do at the moment is exit OpenOCD */
 		LOG_ERROR("No Valid JTAG Interface Configured.");
@@ -1827,13 +2024,16 @@ bool transport_is_jtag(void)
 
 int adapter_resets(int trst, int srst)
 {
-	if (!get_current_transport()) {
+	if (!get_current_transport())
+	{
 		LOG_ERROR("transport is not selected");
 		return ERROR_FAIL;
 	}
 
-	if (transport_is_jtag()) {
-		if (srst == SRST_ASSERT && !(jtag_reset_config & RESET_HAS_SRST)) {
+	if (transport_is_jtag())
+	{
+		if (srst == SRST_ASSERT && !(jtag_reset_config & RESET_HAS_SRST))
+		{
 			LOG_ERROR("adapter has no srst signal");
 			return ERROR_FAIL;
 		}
@@ -1846,16 +2046,20 @@ int adapter_resets(int trst, int srst)
 		 */
 		jtag_execute_queue();
 		return ERROR_OK;
-	} else if (transport_is_swd() || transport_is_hla() ||
-			   transport_is_dapdirect_swd() || transport_is_dapdirect_jtag() ||
-			   transport_is_swim()) {
-		if (trst == TRST_ASSERT) {
+	}
+	else if (transport_is_swd() || transport_is_hla() ||
+			 transport_is_dapdirect_swd() || transport_is_dapdirect_jtag() ||
+			 transport_is_swim())
+	{
+		if (trst == TRST_ASSERT)
+		{
 			LOG_ERROR("transport %s has no trst signal",
-				get_current_transport_name());
+					  get_current_transport_name());
 			return ERROR_FAIL;
 		}
 
-		if (srst == SRST_ASSERT && !(jtag_reset_config & RESET_HAS_SRST)) {
+		if (srst == SRST_ASSERT && !(jtag_reset_config & RESET_HAS_SRST))
+		{
 			LOG_ERROR("adapter has no srst signal");
 			return ERROR_FAIL;
 		}
@@ -1867,26 +2071,28 @@ int adapter_resets(int trst, int srst)
 		return ERROR_OK;
 
 	LOG_ERROR("reset is not supported on transport %s",
-		get_current_transport_name());
+			  get_current_transport_name());
 
 	return ERROR_FAIL;
 }
 
 int adapter_assert_reset(void)
 {
-	if (transport_is_jtag()) {
+	if (transport_is_jtag())
+	{
 		if (jtag_reset_config & RESET_SRST_PULLS_TRST)
 			jtag_add_reset(1, 1);
 		else
 			jtag_add_reset(0, 1);
 		return ERROR_OK;
-	} else if (transport_is_swd() || transport_is_hla() ||
-			   transport_is_dapdirect_jtag() || transport_is_dapdirect_swd() ||
-			   transport_is_swim())
+	}
+	else if (transport_is_swd() || transport_is_hla() ||
+			 transport_is_dapdirect_jtag() || transport_is_dapdirect_swd() ||
+			 transport_is_swim())
 		return adapter_system_reset(1);
 	else if (get_current_transport())
 		LOG_ERROR("reset is not supported on %s",
-			get_current_transport_name());
+				  get_current_transport_name());
 	else
 		LOG_ERROR("transport is not selected");
 	return ERROR_FAIL;
@@ -1894,29 +2100,34 @@ int adapter_assert_reset(void)
 
 int adapter_deassert_reset(void)
 {
-	if (transport_is_jtag()) {
+	if (transport_is_jtag())
+	{
 		jtag_add_reset(0, 0);
 		return ERROR_OK;
-	} else if (transport_is_swd() || transport_is_hla() ||
-			   transport_is_dapdirect_jtag() || transport_is_dapdirect_swd() ||
-			   transport_is_swim())
+	}
+	else if (transport_is_swd() || transport_is_hla() ||
+			 transport_is_dapdirect_jtag() || transport_is_dapdirect_swd() ||
+			 transport_is_swim())
 		return adapter_system_reset(0);
 	else if (get_current_transport())
 		LOG_ERROR("reset is not supported on %s",
-			get_current_transport_name());
+				  get_current_transport_name());
 	else
 		LOG_ERROR("transport is not selected");
 	return ERROR_FAIL;
 }
 
 int adapter_config_trace(bool enabled, enum tpiu_pin_protocol pin_protocol,
-		uint32_t port_size, unsigned int *trace_freq,
-		unsigned int traceclkin_freq, uint16_t *prescaler)
+						 uint32_t port_size, unsigned int *trace_freq,
+						 unsigned int traceclkin_freq, uint16_t *prescaler)
 {
-	if (adapter_driver->config_trace) {
+	if (adapter_driver->config_trace)
+	{
 		return adapter_driver->config_trace(enabled, pin_protocol, port_size, trace_freq,
-			traceclkin_freq, prescaler);
-	} else if (enabled) {
+											traceclkin_freq, prescaler);
+	}
+	else if (enabled)
+	{
 		LOG_ERROR("The selected interface does not support tracing");
 		return ERROR_FAIL;
 	}
@@ -1930,4 +2141,140 @@ int adapter_poll_trace(uint8_t *buf, size_t *size)
 		return adapter_driver->poll_trace(buf, size);
 
 	return ERROR_FAIL;
+}
+
+/*
+ * Virtual JTAG
+ *
+ */
+
+static struct vjtag_tap *__vjtag_all_taps;
+
+struct vjtag_tap *vjtag_all_taps(void)
+{
+	return __vjtag_all_taps;
+};
+
+/** Append a new TAP to the chain of all taps. */
+void vjtag_tap_add(struct vjtag_tap *t)
+{
+	jtag_tap_add_imp((struct jtag_tap **)&__vjtag_all_taps, (struct jtag_tap *)t);
+}
+
+/**
+ * Initilaize Virtual JTAG Tap.
+ * @note Will not fill in @chip, @tapname and @dottedname.
+ * @post Register @tap to master list of jtags.
+ */
+void vjtag_tap_init(struct vjtag_tap *tap)
+{
+	jtag_tap_init_only((struct jtag_tap *)tap);
+	vjtag_tap_add(tap);
+	LOG_DEBUG("Created virtual tap: %s, parent: %s",
+			  tap->dotted_name,
+			  tap->parent->dotted_name);
+}
+
+void vjtag_tap_free(struct vjtag_tap *tap)
+{
+	jtag_tap_free((struct jtag_tap *)tap);
+}
+
+struct vjtag_tap *vjtag_tap_by_string(const char *dotted_name)
+{
+	return (struct vjtag_tap *)jtag_tap_by_string_imp((struct jtag_tap *)vjtag_all_taps(), dotted_name);
+}
+
+bool jtag_tap_on_all_vtaps_list(const struct jtag_tap *const tap)
+{
+	return jtag_tap_on_list((struct jtag_tap *)__vjtag_all_taps, tap);
+}
+
+/*
+ * JTAG hardware
+ *
+ */
+static struct jtag_hardware *__jtag_all_hardwares;
+
+struct jtag_hardware *jtag_all_hardwares(void)
+{
+	return __jtag_all_hardwares;
+};
+
+/**
+ * Append a new hardware to the chain of all hardwares.
+ *
+ * @param hardware The JTAG hardware to add. Expecting
+ *                      \c id and \c address to be filled
+ * @post  \c hardware->position will be updated
+ */
+void jtag_hardware_add(struct jtag_hardware *hardware)
+{
+	unsigned hw_count = 0;
+	struct jtag_hardware **hw = &__jtag_all_hardwares;
+	while (*hw != NULL)
+	{
+		hw_count++;
+		hw = &(*hw)->next_hardware;
+	}
+	*hw = hardware;
+	hardware->position = hw_count;
+}
+
+/**
+ * Initilaize JTAG Hardware.
+ *
+ * @param hardware The JTAG hardware to add. Must have
+ *         id and address field filled in.
+ *         @jtag_hardware_free() will use free() to
+ *         free the memory used by them.
+ */
+void jtag_hardware_init(struct jtag_hardware *hardware)
+{
+	assert(hardware->name != NULL);
+	assert(hardware->address != NULL);
+	hardware->position = UINT_MAX;
+}
+
+void jtag_hardware_free(struct jtag_hardware *hardware)
+{
+	if (hardware->name)
+	{
+		free(hardware->name);
+		hardware->name = NULL;
+	}
+	if (hardware->address)
+	{
+		free(hardware->address);
+		hardware->address = NULL;
+	}
+	free(hardware);
+}
+
+struct jtag_hardware *jtag_hardware_by_string(const char *name)
+{
+	struct jtag_hardware *t = jtag_all_hardwares();
+
+	while (t)
+	{
+		if (0 == strcmp(t->name, name))
+			return t;
+		t = t->next_hardware;
+	}
+
+	return t;
+}
+
+bool jtag_hardware_on_all_hardwares_list(struct jtag_hardware *hardware)
+{
+	struct jtag_hardware *hw = jtag_all_hardwares();
+	while (hw)
+	{
+		if (hw == hardware)
+		{
+			return true;
+		}
+		hw = hw->next_hardware;
+	}
+	return false;
 }

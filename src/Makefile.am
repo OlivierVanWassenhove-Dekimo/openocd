@@ -3,6 +3,11 @@
 noinst_LTLIBRARIES += %D%/libopenocd.la
 bin_PROGRAMS += %D%/openocd
 
+
+%C%_openocd_CFLAGS = $(AM_CFLAGS) $(CFLAGS) -g
+
+%C%_openocd_LDADD =
+
 %C%_openocd_SOURCES = \
 	%D%/main.c
 
@@ -10,9 +15,9 @@ bin_PROGRAMS += %D%/openocd
 	%D%/hello.c %D%/hello.h \
 	%D%/openocd.c %D%/openocd.h
 
-%C%_openocd_LDADD = %D%/libopenocd.la
+%C%_openocd_LDFLAGS =
 
-%C%_openocd_LDADD += $(MINGWLDADD)
+%C%_openocd_LDADD = %D%/libopenocd.la
 
 if INTERNAL_JIMTCL
 %C%_openocd_LDADD += $(top_builddir)/jimtcl/libjim.a
@@ -46,10 +51,23 @@ endif
 # the library search path.
 %C%_libopenocd_la_LDFLAGS = $(all_libraries)
 
+
+if AJI_CLIENT
+%C%_openocd_LDADD +=  src/libaji_client.a
+endif
+
 if IS_MINGW
-MINGWLDADD = -lws2_32
+if AJI_CLIENT
+%C%_openocd_LDADD +=  src/libshlwapi.a 
+  #you can find and copy the file from mingw installation.
+%C%_openocd_LDADD +=  -lws2_32 -lstdc++ 
+  # the -l flags are with _LDADD, not _LDFLAGS ...
+  # ... because they have to be at the end
+  # ... of the command line. mingw is sensitive to this
+endif
 else
-MINGWLDADD =
+%C%_openocd_LDADD +=  -lstdc++
+   #should I really add stdc++ library here?
 endif
 
 %C%_libopenocd_la_LIBADD = \

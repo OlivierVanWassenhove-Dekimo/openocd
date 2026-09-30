@@ -1,12 +1,28 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /***************************************************************************
-*   Copyright (C) 2005 by Dominic Rath                                    *
-*   Dominic.Rath@gmx.de                                                   *
-*                                                                         *
-*   Copyright (C) 2007-2010 Øyvind Harboe                                 *
-*   oyvind.harboe@zylin.com                                               *
-***************************************************************************/
+ *   Copyright (C) 2005 by Dominic Rath                                    *
+ *   Dominic.Rath@gmx.de                                                   *
+ *                                                                         *
+ *   Copyright (C) 2007-2010 Øyvind Harboe                                 *
+ *   oyvind.harboe@zylin.com                                               *
+ *                                                                         *
+ *   Copyright (C) 2021 Cinly Ooi                                          *
+ *   cinly.ooi@intel.com                                                   *
+ *                                                                         *
+ *   This program is free software; you can redistribute it and/or modify  *
+ *   it under the terms of the GNU General Public License as published by  *
+ *   the Free Software Foundation; either version 2 of the License, or     *
+ *   (at your option) any later version.                                   *
+ *                                                                         *
+ *   This program is distributed in the hope that it will be useful,       *
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of        *
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         *
+ *   GNU General Public License for more details.                          *
+ *                                                                         *
+ *   You should have received a copy of the GNU General Public License     *
+ *   along with this program.  If not, see <http://www.gnu.org/licenses/>. *
+ ***************************************************************************/
 
 #ifndef OPENOCD_JTAG_JTAG_H
 #define OPENOCD_JTAG_JTAG_H
@@ -34,7 +50,8 @@
  * Fix those drivers to map as appropriate ... then pick some
  * sane set of numbers here (where 0/uninitialized == INVALID).
  */
-enum tap_state {
+enum tap_state
+{
 	TAP_INVALID = -1,
 
 	/* Proper ARM recommended numbers */
@@ -59,10 +76,10 @@ enum tap_state {
 /**
  * Defines arguments for reset functions
  */
-#define SRST_DEASSERT   0
-#define SRST_ASSERT     1
-#define TRST_DEASSERT   0
-#define TRST_ASSERT     1
+#define SRST_DEASSERT 0
+#define SRST_ASSERT 1
+#define TRST_DEASSERT 0
+#define TRST_ASSERT 1
 
 /**
  * Function tap_state_name
@@ -84,7 +101,8 @@ extern enum tap_state cmd_queue_cur_state;
  * In addition, this structure includes a value and mask that is used by
  * jtag_add_dr_scan_check() to validate the value that was scanned out.
  */
-struct scan_field {
+struct scan_field
+{
 	/** The number of bits this field specifies */
 	unsigned int num_bits;
 	/** A pointer to value to be scanned into the device */
@@ -98,7 +116,8 @@ struct scan_field {
 	uint8_t *check_mask;
 };
 
-struct jtag_tap {
+struct jtag_tap
+{
 	char *chip;
 	char *tapname;
 	char *dotted_name;
@@ -112,7 +131,7 @@ struct jtag_tap {
 	uint8_t *expected; /**< Capture-IR expected value */
 	uint32_t ir_capture_mask;
 	uint8_t *expected_mask; /**< Capture-IR expected mask */
-	uint32_t idcode; /**< device identification code */
+	uint32_t idcode;		/**< device identification code */
 	/** not all devices have idcode,
 	 * we'll discover this during chain examination */
 	bool has_idcode;
@@ -139,6 +158,9 @@ struct jtag_tap {
 	struct jtag_tap_event_action *event_action;
 
 	struct jtag_tap *next_tap;
+
+	char *hardware; /**< The JTAG hardware containing this tap. Optional */
+
 	/* private pointer to support none-jtag specific functions */
 	void *priv;
 };
@@ -176,14 +198,16 @@ unsigned int jtag_tap_count_enabled(void);
  *   the specific JTAG router type.  They might be triggered indirectly
  *   from EVENT_SETUP operations.
  */
-enum jtag_event {
+enum jtag_event
+{
 	JTAG_TRST_ASSERTED,
 	JTAG_TAP_EVENT_SETUP,
 	JTAG_TAP_EVENT_ENABLE,
 	JTAG_TAP_EVENT_DISABLE,
 };
 
-struct jtag_tap_event_action {
+struct jtag_tap_event_action
+{
 	/** The event for which this action will be triggered. */
 	enum jtag_event event;
 	/** The interpreter to use for evaluating the @c body. */
@@ -212,16 +236,17 @@ int jtag_unregister_event_callback(jtag_event_handler_t f, void *x);
 
 int jtag_call_event_callbacks(enum jtag_event event);
 
-enum reset_types {
-	RESET_NONE            = 0x0,
-	RESET_HAS_TRST        = 0x1,
-	RESET_HAS_SRST        = 0x2,
-	RESET_TRST_AND_SRST   = 0x3,
+enum reset_types
+{
+	RESET_NONE = 0x0,
+	RESET_HAS_TRST = 0x1,
+	RESET_HAS_SRST = 0x2,
+	RESET_TRST_AND_SRST = 0x3,
 	RESET_SRST_PULLS_TRST = 0x4,
 	RESET_TRST_PULLS_SRST = 0x8,
 	RESET_TRST_OPEN_DRAIN = 0x10,
-	RESET_SRST_PUSH_PULL  = 0x20,
-	RESET_SRST_NO_GATING  = 0x40,
+	RESET_SRST_PUSH_PULL = 0x20,
+	RESET_SRST_NO_GATING = 0x40,
 	RESET_CNCT_UNDER_SRST = 0x80
 };
 
@@ -295,20 +320,20 @@ int jtag_init_inner(struct command_context *cmd_ctx);
  *
  */
 void jtag_add_ir_scan(struct jtag_tap *tap,
-		struct scan_field *fields, enum tap_state endstate);
+					  struct scan_field *fields, enum tap_state endstate);
 /**
  * The same as jtag_add_ir_scan except no verification is performed out
  * the output values.
  */
 void jtag_add_ir_scan_noverify(struct jtag_tap *tap,
-		const struct scan_field *fields, enum tap_state state);
+							   const struct scan_field *fields, enum tap_state state);
 /**
  * Scan out the bits in ir scan mode.
  *
  * If in_bits == NULL, discard incoming bits.
  */
 void jtag_add_plain_ir_scan(int num_bits, const uint8_t *out_bits, uint8_t *in_bits,
-		enum tap_state endstate);
+							enum tap_state endstate);
 
 /**
  * Generate a DR SCAN using the fields passed to the function.
@@ -317,17 +342,17 @@ void jtag_add_plain_ir_scan(int num_bits, const uint8_t *out_bits, uint8_t *in_b
  * 1-bit field.  The bypass status of TAPs is set by jtag_add_ir_scan().
  */
 void jtag_add_dr_scan(struct jtag_tap *tap, int num_fields,
-		const struct scan_field *fields, enum tap_state endstate);
+					  const struct scan_field *fields, enum tap_state endstate);
 /** A version of jtag_add_dr_scan() that uses the check_value/mask fields */
 void jtag_add_dr_scan_check(struct jtag_tap *tap, int num_fields,
-		struct scan_field *fields, enum tap_state endstate);
+							struct scan_field *fields, enum tap_state endstate);
 /**
  * Scan out the bits in ir scan mode.
  *
  * If in_bits == NULL, discard incoming bits.
  */
 void jtag_add_plain_dr_scan(int num_bits,
-		const uint8_t *out_bits, uint8_t *in_bits, enum tap_state endstate);
+							const uint8_t *out_bits, uint8_t *in_bits, enum tap_state endstate);
 
 /**
  * Defines the type of data passed to the jtag_callback_t interface.
@@ -347,7 +372,6 @@ typedef void (*jtag_callback1_t)(jtag_callback_data_t data0);
 
 /** A simpler version of jtag_add_callback4(). */
 void jtag_add_callback(jtag_callback1_t f, jtag_callback_data_t data0);
-
 
 /**
  * Defines the interface of the JTAG callback mechanism.  Such
@@ -377,9 +401,9 @@ void jtag_add_callback(jtag_callback1_t f, jtag_callback_data_t data0);
  * @returns an error code
  */
 typedef int (*jtag_callback_t)(jtag_callback_data_t data0,
-				jtag_callback_data_t data1,
-				jtag_callback_data_t data2,
-				jtag_callback_data_t data3);
+							   jtag_callback_data_t data1,
+							   jtag_callback_data_t data2,
+							   jtag_callback_data_t data3);
 
 /**
  * Run a TAP_RESET reset where the end state is TAP_RESET,
@@ -549,16 +573,16 @@ void jtag_sleep(uint32_t us);
  * The JTAG subsystem defines a number of error codes,
  * using codes between -100 and -199.
  */
-#define ERROR_JTAG_INIT_FAILED       (-100)
+#define ERROR_JTAG_INIT_FAILED (-100)
 #define ERROR_JTAG_INVALID_INTERFACE (-101)
-#define ERROR_JTAG_NOT_IMPLEMENTED   (-102)
-#define ERROR_JTAG_TRST_ASSERTED     (-103)
-#define ERROR_JTAG_QUEUE_FAILED      (-104)
-#define ERROR_JTAG_NOT_STABLE_STATE  (-105)
-#define ERROR_JTAG_DEVICE_ERROR      (-107)
-#define ERROR_JTAG_STATE_INVALID     (-108)
+#define ERROR_JTAG_NOT_IMPLEMENTED (-102)
+#define ERROR_JTAG_TRST_ASSERTED (-103)
+#define ERROR_JTAG_QUEUE_FAILED (-104)
+#define ERROR_JTAG_NOT_STABLE_STATE (-105)
+#define ERROR_JTAG_DEVICE_ERROR (-107)
+#define ERROR_JTAG_STATE_INVALID (-108)
 #define ERROR_JTAG_TRANSITION_INVALID (-109)
-#define ERROR_JTAG_INIT_SOFT_FAIL    (-110)
+#define ERROR_JTAG_INIT_SOFT_FAIL (-110)
 
 /**
  * Set the current JTAG core execution error, unless one was set
@@ -601,5 +625,66 @@ void jtag_poll_unmask(bool saved);
 #include <jtag/minidriver.h>
 
 __COMMAND_HANDLER(handle_jtag_newtap);
+
+/**
+ * Virtual JTAG suitable for SLD.
+ */
+struct vjtag_tap
+{
+	/* Must be first element, to make vjtag_tap useable wherever
+	 * #jtag_tap can be used. See #jim_vjtag_create_cmd() for
+	 * reinterpretation of some #jtag_tap parameters
+	 *
+	 * @note that <tt>vjtag_tap->next </tt>which is inheritted from #jtag_tap,
+	 *       will be a #jtag_tap pointer that  needs to be recasted
+	 *		 back to #vjtag_tap
+	 * @note <tt>vjtag_tap->hardware</tt> is always \c NULL To find out
+	 *       which hardware it belongs to, goto <tt>vjtag_tap->parent</tt>
+	 *
+	 * On gcc 9.3.0, we get a warning
+	 *
+	 *./src/jtag/jtag.h:XXX:YY: warning: declaration does not declare anything
+	 * XXX |  struct jtag_tap; //< TAP parameters.
+	 *     |
+	 * This is a false warning. "stuct jtag" is an anonymous struct which
+	 * is legal under C11 standard. The resulting executable is still
+	 * working as it is.
+	 *
+	 * Equally unfortunately, I don't know how to disable the warning               ^
+	 */
+	struct jtag_tap;		 //< TAP parameters. \note Ignore "warning: declaration does not declare anything"
+	struct jtag_tap *parent; //< The physical jtag it is based on.
+}; // end vjtag_tap
+
+void vjtag_tap_init(struct vjtag_tap *tap);
+void vjtag_tap_free(struct vjtag_tap *tap);
+
+struct vjtag_tap *vjtag_all_taps(void);
+void vjtag_tap_add(struct vjtag_tap *t);
+struct vjtag_tap *vjtag_tap_by_string(const char *dotted_name);
+bool jtag_tap_on_all_vtaps_list(const struct jtag_tap *const tap);
+
+/**
+ * JTAG hardware
+ */
+
+struct jtag_hardware
+{
+	char *name;							 //< Hardware cable identifier. Must be unique for the openocd instance.
+	char *address;						 //< The identifier used by aji_client to identify this hardware.
+	unsigned position;					 //< The position of the hardware, UINT_MAX if not yet assigned, or value invalid
+	struct jtag_hardware *next_hardware; //< Pointer to the next hardware
+}; // ennd jtag_hardware
+
+void jtag_hardware_init(struct jtag_hardware *tap);
+void jtag_hardware_free(struct jtag_hardware *tap);
+
+struct jtag_hardware *jtag_all_hardwares(void);
+void jtag_hardware_add(struct jtag_hardware *t);
+struct jtag_hardware *jtag_hardware_by_string(const char *id);
+bool jtag_hardware_on_all_jtag_hardware_list(struct jtag_hardware *tap);
+
+__COMMAND_HANDLER(vjtag_create);
+__COMMAND_HANDLER(jtag_newhardware);
 
 #endif /* OPENOCD_JTAG_JTAG_H */

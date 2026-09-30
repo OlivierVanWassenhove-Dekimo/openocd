@@ -27,7 +27,6 @@
  * cable.
  */
 
-
 /** implementation of wrapper function tap_set_state() */
 void tap_set_state_impl(enum tap_state new_state);
 
@@ -47,10 +46,11 @@ void tap_set_state_impl(enum tap_state new_state);
  * @param new_state The state we think the TAPs are currently in (or
  * are about to enter).
  */
-#define tap_set_state(new_state) \
-	do { \
+#define tap_set_state(new_state)                                      \
+	do                                                                \
+	{                                                                 \
 		LOG_DEBUG_IO("tap_set_state(%s)", tap_state_name(new_state)); \
-		tap_set_state_impl(new_state); \
+		tap_set_state_impl(new_state);                                \
 	} while (0)
 
 /**
@@ -112,7 +112,6 @@ int tap_get_tms_path(enum tap_state from, enum tap_state to);
  */
 int tap_get_tms_path_len(enum tap_state from, enum tap_state to);
 
-
 /**
  * Function tap_move_ndx
  * when given a stable state, returns an index from 0-5.  The index corresponds to a
@@ -145,8 +144,7 @@ enum tap_state tap_state_transition(enum tap_state current_state, bool tms);
 
 static inline bool tap_is_state_next(enum tap_state from, enum tap_state to)
 {
-	return tap_state_transition(from, false) == to
-		|| tap_state_transition(from, true) == to;
+	return tap_state_transition(from, false) == to || tap_state_transition(from, true) == to;
 }
 
 /** Allow switching between old and new TMS tables. @see tap_get_tms_path */
@@ -155,7 +153,7 @@ void tap_use_new_tms_table(bool use_new);
 bool tap_uses_new_tms_table(void);
 
 enum tap_state jtag_debug_state_machine_(const void *tms_buf, const void *tdi_buf,
-		unsigned int tap_len, enum tap_state start_tap_state);
+										 unsigned int tap_len, enum tap_state start_tap_state);
 
 /**
  * @brief Prints verbose TAP state transitions for the given TMS/TDI buffers.
@@ -166,7 +164,7 @@ enum tap_state jtag_debug_state_machine_(const void *tms_buf, const void *tdi_bu
  * @returns the final TAP state; pass as @a start_tap_state in following call.
  */
 static inline enum tap_state jtag_debug_state_machine(const void *tms_buf,
-		const void *tdi_buf, unsigned int tap_len, enum tap_state start_tap_state)
+													  const void *tdi_buf, unsigned int tap_len, enum tap_state start_tap_state)
 {
 	if (LOG_LEVEL_IS(LOG_LVL_DEBUG_IO))
 		return jtag_debug_state_machine_(tms_buf, tdi_buf, tap_len, start_tap_state);
@@ -186,12 +184,13 @@ static inline enum tap_state jtag_debug_state_machine(const void *tms_buf,
  * eventually to cope with systems which have more than one such
  * debugging interface.
  */
-struct jtag_interface {
+struct jtag_interface
+{
 	/**
 	 * Bit vector listing capabilities exposed by this driver.
 	 */
 	unsigned int supported;
-#define DEBUG_CAP_TMS_SEQ	(1 << 0)
+#define DEBUG_CAP_TMS_SEQ (1 << 0)
 
 	/**
 	 * Execute commands in the supplied queue
@@ -211,9 +210,10 @@ struct jtag_interface {
  * eventually to cope with systems which have more than one such
  * debugging interface.
  */
-struct adapter_driver {
+struct adapter_driver
+{
 	/** The name of the interface driver. */
-	const char * const name;
+	const char *const name;
 
 	/**
 	 * Bitmask of transport IDs supported in C code.
@@ -339,8 +339,8 @@ struct adapter_driver {
 	 * @returns ERROR_OK on success, an error code on failure.
 	 */
 	int (*config_trace)(bool enabled, enum tpiu_pin_protocol pin_protocol,
-		uint32_t port_size, unsigned int *trace_freq,
-		unsigned int traceclkin_freq, uint16_t *prescaler);
+						uint32_t port_size, unsigned int *trace_freq,
+						unsigned int traceclkin_freq, uint16_t *prescaler);
 
 	/**
 	 * Poll for new trace data
@@ -373,8 +373,8 @@ int adapter_resets(int assert_trst, int assert_srst);
 int adapter_assert_reset(void);
 int adapter_deassert_reset(void);
 int adapter_config_trace(bool enabled, enum tpiu_pin_protocol pin_protocol,
-		uint32_t port_size, unsigned int *trace_freq,
-		unsigned int traceclkin_freq, uint16_t *prescaler);
+						 uint32_t port_size, unsigned int *trace_freq,
+						 unsigned int traceclkin_freq, uint16_t *prescaler);
 int adapter_poll_trace(uint8_t *buf, size_t *size);
 
 // Keep in alphabetic order this list of drivers
@@ -423,5 +423,6 @@ extern struct adapter_driver xds110_adapter_driver;
 extern struct adapter_driver xlnx_axi_xvc_adapter_driver;
 extern struct adapter_driver xlnx_pcie_xvc_adapter_driver;
 extern struct adapter_driver xvc_adapter_driver;
+extern struct adapter_driver aji_client_adapter_driver;
 
 #endif /* OPENOCD_JTAG_INTERFACE_H */
