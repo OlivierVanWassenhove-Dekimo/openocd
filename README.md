@@ -1,3 +1,10 @@
+
+# OpenOCD Agilex HPS fork
+To facilitate debugging the Agilex HPS, this repository comes with some additional features compared to baseline OpenOCD:
+
+- Integration with Intel's old `[aji_openocd](https://github.com/intel/aji_openocd)` fork, which has been merged back into modern upstream OpenOCD. This allows communication with the Agilex SDM over the proprietary JTAG USB Blaster interface as long as Altera's `jtagd` or `jtagserver.exe` is running in the background.
+- AArch64 MRS/MSR instruction support to access and modify system registers, which allows e.g. warm resets.
+
 # Welcome to OpenOCD
 
 OpenOCD provides on-chip programming and debugging support with a
