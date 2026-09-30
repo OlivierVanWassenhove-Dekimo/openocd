@@ -1,0 +1,22 @@
+diff --git a/src/jtag/jtag_tcpclient.cpp b/src/jtag/jtag_tcpclient.cpp
+index 3367ec7..c7f17ad 100644
+--- a/src/jtag/jtag_tcpclient.cpp
++++ b/src/jtag/jtag_tcpclient.cpp
+@@ -83,6 +83,8 @@
+ #include "jtag_common.h"
+ #endif
+ 
++#include <cstdint>
++
+ //START_FUNCTION_HEADER////////////////////////////////////////////////////////
+ 
+ TCPCLIENT::TCPCLIENT(void) : m_addr(NULL), m_addr_count(0)
+@@ -130,7 +132,7 @@ bool TCPCLIENT::lookup(const char * server, DWORD port)
+         m_addr_len = 4;
+         m_addr_count = 1;
+ 
+-        * reinterpret_cast<unsigned long *>(m_addr) = addr;
++        * reinterpret_cast<uint32_t *>(m_addr) = addr;
+     }
+     else
+     {
