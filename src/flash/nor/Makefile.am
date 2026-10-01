@@ -25,6 +25,7 @@ NOR_DRIVERS = \
 	%D%/avrf.c \
 	%D%/bl602.c \
 	%D%/bluenrg-x.c \
+	%D%/cadence_qspi.c \
 	%D%/cc3220sf.c \
 	%D%/cc26xx.c \
 	%D%/cfi.c \

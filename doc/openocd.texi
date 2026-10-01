@@ -6761,6 +6761,74 @@ flash bank $_FLASHNAME fespi 0x20000000 0 0 0 $_TARGETNAME
 @end example
 @end deffn
 
+@deffn {Flash Driver} {cadence_qspi}
+@cindex Cadence Quad SPI
+@cindex cadence_qspi
+SPI NOR flash attached to a Cadence Quad SPI flash controller, as used
+in the Intel/Altera SoC FPGA families, e.g. the Agilex 5 HPS.
+The controller handling follows the Linux @file{spi-cadence-quadspi.c}
+driver with the settings used for @code{intel,socfpga-qspi}: all data
+is transferred in indirect mode through the controller's SRAM FIFO, and
+all flash commands are issued in single line (1-1-1) mode.
+The flash is identified by its JEDEC ID (falling back to SFDP); size,
+page and sector size are taken from the device table.
+Micron N25Q/MT25Q devices (e.g. MT25QU01G) use the flag status register
+to detect completion and program/erase failures.
+
+The @var{base} parameter only places the bank in OpenOCD's address space,
+as the flash is not memory mapped; @var{size} may be @var{0}, in which
+case the detected size is used.
+The @var{target} should preferably be a @code{mem_ap} target giving
+access to the controller (e.g. the AXI-AP of the Agilex 5 HPS): the FIFO
+is then accessed with non-incrementing MEM-AP bursts, register writes are
+queued, and the CPUs do not need to be halted. Any other target type works
+too, but is considerably slower.
+
+The boot firmware (e.g. the SDM on Agilex) must have given the HPS access
+to the QSPI controller. Unless @option{-ref-clk} is given, the SPI clock
+and timing configuration set up by the boot firmware is left untouched.
+
+Optional driver arguments, with defaults for the Agilex 5 HPS:
+@itemize
+@item @option{-ctrl-base} @var{addr} ... controller register base
+(default @var{0x108d2000}).
+@item @option{-ahb-base} @var{addr} ... address of the indirect access
+(AHB trigger) window used to access the FIFO (default @var{0x10900000}).
+@item @option{-trigger-address} @var{addr} ... value programmed into the
+indirect trigger address register (default @var{0}).
+@item @option{-fifo-depth} @var{words} ... SRAM FIFO depth; detected
+automatically by default.
+@item @option{-fifo-width} @var{bytes} ... SRAM FIFO width, only @var{4}
+is supported.
+@item @option{-cs} @var{n} ... chip select 0..3 (default @var{0}).
+@item @option{-decoded-cs} ... chip selects are externally decoded.
+@item @option{-ref-clk} @var{hz} ... QSPI reference clock. When given,
+baud rate divider, delays and read data capture are programmed like the
+Linux driver does, using the following options.
+@item @option{-sclk} @var{hz} ... requested SPI clock (default @var{100000000}).
+@item @option{-read-delay} @var{n}, @option{-rclk-en} ... read data
+capture configuration (default @var{2}, bypass).
+@item @option{-tshsl-ns}, @option{-tsd2d-ns}, @option{-tchsh-ns},
+@option{-tslch-ns} @var{ns} ... chip select timings (defaults @var{50},
+@var{50}, @var{4}, @var{4}).
+@end itemize
+
+Like for other SPI flash drivers, @command{flash write_bank} does not
+erase; use @command{flash erase_sector} or @command{flash erase_address}
+first, or @command{flash write_image erase}.
+
+@example
+# Agilex 5: flash behind the HPS AXI-AP
+target create hps.sys_bus mem_ap -dap hps.dap -ap-num 0x4000
+flash bank agilex_flash cadence_qspi 0x0 0 0 0 hps.sys_bus
+
+# after init:
+flash erase_address pad 0x0 [file size zephyr.bin]
+flash write_bank agilex_flash zephyr.bin 0x0
+flash verify_bank agilex_flash zephyr.bin 0x0
+@end example
+@end deffn
+
 @deffn {Flash Driver} {dw-spi}
 @cindex DesignWare SPI controller driver
 @cindex DW-SPI

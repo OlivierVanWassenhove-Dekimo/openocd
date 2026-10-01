@@ -1,0 +1,41 @@
+Block   Base Address    End Address
+hps2sdm_qspi_regs	0x108D2000	0x108D20FF	
+
+Register	Offset	Size	Access	Reset	Description
+cfg	0x00000000	32	RW	0x80780000	
+devrd	0x00000004	32	RW	0x00000003	
+devwr	0x00000008	32	RW	0x00000002	
+delay	0x0000000C	32	RW	0x00000000	This register is used to introduce relative delays into the generation of the master output signals.
+rddatacap	0x00000010	32	RW	0x00000001	
+devsz	0x00000014	32	RW	0x00101002	
+srampart	0x00000018	32	RW	0x00000200	
+indaddrtrig	0x0000001C	32	RW	0x00000000	
+dmaper	0x00000020	32	RW	0x00000000	
+remapaddr	0x00000024	32	RW	0x00000000	
+modebit	0x00000028	32	RW	0x00000000	
+sramfill	0x0000002C	32	RO	0x00000000	
+txthresh	0x00000030	32	RW	0x00000001	
+rxthresh	0x00000034	32	RW	0x00000001	Device Instruction Configuration Register
+irqstat	0x00000040	32	RW	0x00000000	The status fields in this register are set when the described event occurs and the interrupt is enabled in the mask register.
+irqmask	0x00000044	32	RW	0x00000000	0 : the interrupt for the corresponding interrupt status register bit is disabled.
+lowwrprot	0x00000050	32	RW	0x00000000	
+uppwrprot	0x00000054	32	RW	0x00000000	
+wrprot	0x00000058	32	RW	0x00000000	
+indrd	0x00000060	32	RW	0x00000000	
+indrdwater	0x00000064	32	RW	0x00000000	
+indrdstaddr	0x00000068	32	RW	0x00000000	
+indrdcnt	0x0000006C	32	RW	0x00000000	
+indwr	0x00000070	32	RW	0x00000000	
+indwrwater	0x00000074	32	RW	0xFFFFFFFF	
+indwrstaddr	0x00000078	32	RW	0x00000000	
+indwrcnt	0x0000007C	32	RW	0x00000000	
+flashcmd	0x00000090	32	RW	0x00000000	
+flashcmdaddr	0x00000094	32	RW	0x00000000	
+flashcmdrddatalo	0x000000A0	32	RO	0x00000000	
+flashcmdrddataup	0x000000A4	32	RO	0x00000000	Device Instruction Configuration Register
+flashcmdwrdatalo	0x000000A8	32	RW	0x00000000	
+flashcmdwrdataup	0x000000AC	32	RW	0x00000000	
+moduleid	0x000000FC	32	RO	0x00001001
+
+Block   Base Address    End Address
+hps2sdm_qspi_data	0x10900000	0x109FFFFF	
