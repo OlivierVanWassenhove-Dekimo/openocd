@@ -6811,6 +6811,8 @@ capture configuration (default @var{2}, bypass).
 @item @option{-tshsl-ns}, @option{-tsd2d-ns}, @option{-tchsh-ns},
 @option{-tslch-ns} @var{ns} ... chip select timings (defaults @var{50},
 @var{50}, @var{4}, @var{4}).
+@item @option{-write-mode} @option{stream}|@option{page} ... how data is
+programmed, see @command{cadence_qspi write_mode} (default @option{stream}).
 @end itemize
 
 Like for other SPI flash drivers, @command{flash write_bank} does not
@@ -6827,6 +6829,17 @@ flash erase_address pad 0x0 [file size zephyr.bin]
 flash write_bank agilex_flash zephyr.bin 0x0
 flash verify_bank agilex_flash zephyr.bin 0x0
 @end example
+
+@deffn {Command} {cadence_qspi write_mode} bank_id [@option{stream}|@option{page}]
+Shows or selects how data is programmed. With @option{stream} (the default),
+up to 64 KiB are programmed with a single indirect write: the controller
+splits the data into page programs, sending WRITE ENABLE before and polling
+the flash status after each one, while the driver keeps its SRAM FIFO
+filled. With @option{page}, every page is programmed with its own WRITE
+ENABLE, page program and status polling commands, like the Linux spi-nor
+layer does; this needs several debugger round trips per page and is
+therefore much slower.
+@end deffn
 @end deffn
 
 @deffn {Flash Driver} {dw-spi}

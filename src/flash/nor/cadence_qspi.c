@@ -29,6 +29,12 @@
  *  - The SPI clock divider and delay registers are only (re)programmed when
  *    the QSPI reference clock is supplied via "-ref-clk"; otherwise the
  *    timing set up by the boot firmware (SDM, U-Boot, ...) is left alone.
+ *  - By default, data is programmed with multi-page indirect writes (see
+ *    cqspi_write_stream()) instead of one page program per page as the
+ *    Linux spi-nor layer does; the latter is available as "page" write
+ *    mode. Polling sequences are batched into single DAP transactions where
+ *    that yields the same register accesses; for a debugger, round trips
+ *    rather than the flash or the controller determine performance.
  *
  * The (small) part of the Linux spi-nor core needed to erase, program and
  * read a flash is implemented on top of cqspi_mem_process(), mirroring the
@@ -126,6 +132,8 @@
 #define CQSPI_REG_SIZE				0x14
 #define CQSPI_REG_SIZE_ADDRESS_LSB		0
 #define CQSPI_REG_SIZE_ADDRESS_MASK		0xF
+#define CQSPI_REG_SIZE_PAGE_LSB			4
+#define CQSPI_REG_SIZE_PAGE_MASK		0xFFF
 
 #define CQSPI_REG_SRAMPARTITION			0x18
 #define CQSPI_REG_INDIRECTTRIGGER		0x1C
@@ -202,6 +210,19 @@
 /* Default number of dummy clocks of FAST_READ in 1-1-1 mode */
 #define SPI_NOR_FAST_READ_DUMMY_CLKS		8
 
+/* Maximum size of one multi-page ("streaming") write, see cqspi_flash_write() */
+#define CQSPI_STREAM_CHUNK			0x10000
+
+enum cqspi_write_mode {
+	CQSPI_WRITE_STREAM,	/* multi-page indirect writes (default) */
+	CQSPI_WRITE_PAGE,	/* one page program per page, like Linux spi-nor */
+};
+
+static const char * const cqspi_write_mode_names[] = {
+	[CQSPI_WRITE_STREAM] = "stream",
+	[CQSPI_WRITE_PAGE] = "page",
+};
+
 /* Minimal equivalent of the Linux 'struct spi_mem_op' */
 enum cqspi_data_dir {
 	CQSPI_DATA_NONE,
@@ -271,11 +292,21 @@ struct cqspi_flash_bank {
 	uint8_t read_opcode;
 	uint8_t read_dummy_nbytes;
 	bool use_fsr;
+	enum cqspi_write_mode write_mode;
 
 	/* MEM-AP of a "mem_ap" target, held for the duration of one operation */
 	struct adiv5_ap *ap;
 	/* landing zone for queued reads whose value is ignored */
 	uint32_t discard;
+
+	/*
+	 * Controller state known for the duration of one operation (reset by
+	 * cqspi_op_begin()); nothing but this driver changes these registers
+	 * meanwhile, so they need not be read back for every flash command.
+	 */
+	bool dtr_off_known;	/* CONFIG has DTR and dual opcode disabled */
+	bool size_reg_valid;	/* size_reg holds the value of CQSPI_REG_SIZE */
+	uint32_t size_reg;
 };
 
 /* ------------------------------------------------------------------------ */
@@ -309,6 +340,8 @@ static void cqspi_op_begin(struct flash_bank *bank)
 	struct cqspi_flash_bank *cqspi = bank->driver_priv;
 
 	cqspi->ap = cqspi_get_mem_ap(bank);
+	cqspi->dtr_off_known = false;
+	cqspi->size_reg_valid = false;
 }
 
 static int cqspi_op_end(struct flash_bank *bank, int retval)
@@ -374,10 +407,10 @@ static int cqspi_readl_flush(struct flash_bank *bank, uint32_t reg)
 }
 
 /*
- * Read a register 'count' times back to back. For a mem_ap target this is
- * done in a single DAP transaction.
+ * Read a list of registers back to back. For a mem_ap target this is done
+ * in a single DAP transaction, i.e. a single debugger round trip.
  */
-static int cqspi_readl_rep(struct flash_bank *bank, uint32_t reg, uint32_t *vals,
+static int cqspi_readl_multi(struct flash_bank *bank, const uint32_t *regs, uint32_t *vals,
 		unsigned int count)
 {
 	struct cqspi_flash_bank *cqspi = bank->driver_priv;
@@ -385,19 +418,30 @@ static int cqspi_readl_rep(struct flash_bank *bank, uint32_t reg, uint32_t *vals
 
 	if (!cqspi->ap) {
 		for (unsigned int i = 0; i < count && retval == ERROR_OK; i++)
-			retval = cqspi_readl(bank, reg, &vals[i]);
+			retval = cqspi_readl(bank, regs[i], &vals[i]);
 		return retval;
 	}
 
 	for (unsigned int i = 0; i < count && retval == ERROR_OK; i++)
-		retval = mem_ap_read_u32(cqspi->ap, cqspi->iobase + reg, &vals[i]);
+		retval = mem_ap_read_u32(cqspi->ap, cqspi->iobase + regs[i], &vals[i]);
 	if (retval == ERROR_OK)
 		retval = dap_run(cqspi->ap->dap);
 
 	if (retval != ERROR_OK)
-		LOG_ERROR("cqspi: failed to read register 0x%02" PRIx32 " at " TARGET_ADDR_FMT,
-			reg, cqspi->iobase + reg);
+		LOG_ERROR("cqspi: failed to read registers at " TARGET_ADDR_FMT, cqspi->iobase);
 	return retval;
+}
+
+/* Read a register 'count' times back to back (single DAP transaction). */
+static int cqspi_readl_rep(struct flash_bank *bank, uint32_t reg, uint32_t *vals,
+		unsigned int count)
+{
+	uint32_t regs[8];
+
+	assert(count <= ARRAY_SIZE(regs));
+	for (unsigned int i = 0; i < count; i++)
+		regs[i] = reg;
+	return cqspi_readl_multi(bank, regs, vals, count);
 }
 
 /* Equivalent of ioread32_rep(ahb_base, buf, words) */
@@ -546,8 +590,28 @@ static int cqspi_wait_idle(struct flash_bank *bank)
 	}
 }
 
-static int cqspi_exec_flash_cmd(struct flash_bank *bank, uint32_t reg)
+static bool cqspi_all_idle(const uint32_t *cfg, unsigned int count)
 {
+	for (unsigned int i = 0; i < count; i++)
+		if (!(cfg[i] & BIT(CQSPI_REG_CONFIG_IDLE_LSB)))
+			return false;
+	return true;
+}
+
+/*
+ * Linux: cqspi_exec_flash_cmd(). Additionally reads the first 'n_rd'
+ * (0..2) STIG read data registers into rd_data once the command completed,
+ * as cqspi_command_read() does afterwards in Linux.
+ */
+static int cqspi_exec_flash_cmd(struct flash_bank *bank, uint32_t reg,
+		uint32_t *rd_data, unsigned int n_rd)
+{
+	static const uint32_t status_regs[] = {
+		CQSPI_REG_CMDCTRL,
+		CQSPI_REG_CONFIG, CQSPI_REG_CONFIG, CQSPI_REG_CONFIG,
+		CQSPI_REG_CMDREADDATALOWER, CQSPI_REG_CMDREADDATAUPPER,
+	};
+	uint32_t vals[ARRAY_SIZE(status_regs)];
 	int retval;
 
 	/* Write the CMDCTRL without start execution. */
@@ -560,6 +624,23 @@ static int cqspi_exec_flash_cmd(struct flash_bank *bank, uint32_t reg)
 	if (retval != ERROR_OK)
 		return retval;
 
+	/*
+	 * Fast path: a STIG command takes a few microseconds, while every
+	 * debugger round trip takes much longer. So read what Linux reads next
+	 * in one batch: the completion status, the idle status three times in
+	 * succession (cqspi_wait_idle()) and the read data. If all reads show
+	 * completion, this is exactly what the polling below would have read;
+	 * otherwise fall back to polling.
+	 */
+	retval = cqspi_readl_multi(bank, status_regs, vals, 4 + n_rd);
+	if (retval != ERROR_OK)
+		return retval;
+	if (!(vals[0] & CQSPI_REG_CMDCTRL_INPROGRESS_MASK) && cqspi_all_idle(&vals[1], 3)) {
+		for (unsigned int i = 0; i < n_rd; i++)
+			rd_data[i] = vals[4 + i];
+		return ERROR_OK;
+	}
+
 	/* Polling for completion. */
 	retval = cqspi_wait_for_bit(bank, CQSPI_REG_CMDCTRL,
 			CQSPI_REG_CMDCTRL_INPROGRESS_MASK, true);
@@ -569,34 +650,108 @@ static int cqspi_exec_flash_cmd(struct flash_bank *bank, uint32_t reg)
 	}
 
 	/* Polling QSPI idle status. */
-	return cqspi_wait_idle(bank);
+	retval = cqspi_wait_idle(bank);
+	if (retval != ERROR_OK || !n_rd)
+		return retval;
+
+	return cqspi_readl_multi(bank, &status_regs[4], rd_data, n_rd);
 }
 
 /*
  * DTR operations are never issued by this driver, so only the "disable" leg
  * of the Linux cqspi_enable_dtr() is needed. It still matters, since boot
- * firmware may have left the controller in DTR mode.
+ * firmware may have left the controller in DTR mode. Once DTR is known to
+ * be off, it stays off until the end of the current operation.
  */
 static int cqspi_enable_dtr(struct flash_bank *bank, const struct cqspi_mem_op *op)
 {
+	struct cqspi_flash_bank *cqspi = bank->driver_priv;
 	const uint32_t mask = CQSPI_REG_CONFIG_DTR_PROTO | CQSPI_REG_CONFIG_DUAL_OPCODE;
 	uint32_t reg;
 	int retval;
+
+	if (cqspi->dtr_off_known)
+		return ERROR_OK;
 
 	retval = cqspi_readl(bank, CQSPI_REG_CONFIG, &reg);
 	if (retval != ERROR_OK)
 		return retval;
 
 	/* Shortcut if DTR is already disabled. */
-	if ((reg & mask) == 0)
+	if ((reg & mask) == 0) {
+		cqspi->dtr_off_known = true;
 		return ERROR_OK;
+	}
 	reg &= ~mask;
 
 	retval = cqspi_writel(bank, reg, CQSPI_REG_CONFIG);
 	if (retval != ERROR_OK)
 		return retval;
 
-	return cqspi_wait_idle(bank);
+	retval = cqspi_wait_idle(bank);
+	if (retval == ERROR_OK)
+		cqspi->dtr_off_known = true;
+	return retval;
+}
+
+/*
+ * Address width setup of Linux' cqspi_read_setup() / cqspi_write_setup():
+ * read-modify-write of CQSPI_REG_SIZE, followed by a read to flush the
+ * posted write. The register value is remembered for the rest of the
+ * operation, so it only has to be read from the controller once.
+ */
+static int cqspi_set_addr_width(struct flash_bank *bank, unsigned int addr_nbytes)
+{
+	struct cqspi_flash_bank *cqspi = bank->driver_priv;
+	uint32_t reg;
+	int ret;
+
+	if (!cqspi->size_reg_valid) {
+		ret = cqspi_readl(bank, CQSPI_REG_SIZE, &cqspi->size_reg);
+		if (ret != ERROR_OK)
+			return ret;
+		cqspi->size_reg_valid = true;
+	}
+
+	reg = cqspi->size_reg;
+	reg &= ~CQSPI_REG_SIZE_ADDRESS_MASK;
+	reg |= (addr_nbytes - 1);
+	ret = cqspi_writel(bank, reg, CQSPI_REG_SIZE);
+	if (ret != ERROR_OK) {
+		cqspi->size_reg_valid = false;
+		return ret;
+	}
+	cqspi->size_reg = reg;
+	return cqspi_readl_flush(bank, CQSPI_REG_SIZE); /* Flush posted write. */
+}
+
+/*
+ * Streaming writes: set the device page size in CQSPI_REG_SIZE, which the
+ * controller uses to split indirect writes at page boundaries. Must follow
+ * cqspi_set_addr_width() (which fetches the register value).
+ */
+static int cqspi_set_page_size(struct flash_bank *bank, uint32_t page_size)
+{
+	struct cqspi_flash_bank *cqspi = bank->driver_priv;
+	uint32_t reg;
+	int ret;
+
+	if (!cqspi->size_reg_valid)
+		return ERROR_FAIL;
+
+	reg = cqspi->size_reg;
+	reg &= ~(CQSPI_REG_SIZE_PAGE_MASK << CQSPI_REG_SIZE_PAGE_LSB);
+	reg |= (page_size & CQSPI_REG_SIZE_PAGE_MASK) << CQSPI_REG_SIZE_PAGE_LSB;
+	if (reg == cqspi->size_reg)
+		return ERROR_OK;
+
+	ret = cqspi_writel(bank, reg, CQSPI_REG_SIZE);
+	if (ret != ERROR_OK) {
+		cqspi->size_reg_valid = false;
+		return ret;
+	}
+	cqspi->size_reg = reg;
+	return cqspi_readl_flush(bank, CQSPI_REG_SIZE); /* Flush posted write. */
 }
 
 static int cqspi_command_read(struct flash_bank *bank, const struct cqspi_mem_op *op)
@@ -654,27 +809,21 @@ static int cqspi_command_read(struct flash_bank *bank, const struct cqspi_mem_op
 			return status;
 	}
 
-	status = cqspi_exec_flash_cmd(bank, reg);
-	if (status != ERROR_OK)
-		return status;
+	uint32_t rd_data[2];
 
-	status = cqspi_readl(bank, CQSPI_REG_CMDREADDATALOWER, &reg);
+	status = cqspi_exec_flash_cmd(bank, reg, rd_data, n_rx > 4 ? 2 : 1);
 	if (status != ERROR_OK)
 		return status;
 
 	/* Put the read value into rx_buf */
 	uint8_t tmp[4];
-	h_u32_to_le(tmp, reg);
+	h_u32_to_le(tmp, rd_data[0]);
 	read_len = (n_rx > 4) ? 4 : n_rx;
 	memcpy(rxbuf, tmp, read_len);
 	rxbuf += read_len;
 
 	if (n_rx > 4) {
-		status = cqspi_readl(bank, CQSPI_REG_CMDREADDATAUPPER, &reg);
-		if (status != ERROR_OK)
-			return status;
-
-		h_u32_to_le(tmp, reg);
+		h_u32_to_le(tmp, rd_data[1]);
 		read_len = n_rx - read_len;
 		memcpy(rxbuf, tmp, read_len);
 	}
@@ -744,7 +893,7 @@ static int cqspi_command_write(struct flash_bank *bank, const struct cqspi_mem_o
 		}
 	}
 
-	ret = cqspi_exec_flash_cmd(bank, reg);
+	ret = cqspi_exec_flash_cmd(bank, reg, NULL, 0);
 
 	/* Reset CMD_CTRL Reg once command write completes */
 	int ret2 = cqspi_writel(bank, 0, CQSPI_REG_CMDCTRL);
@@ -783,15 +932,7 @@ static int cqspi_read_setup(struct flash_bank *bank, const struct cqspi_mem_op *
 		return ret;
 
 	/* Set address width */
-	ret = cqspi_readl(bank, CQSPI_REG_SIZE, &reg);
-	if (ret != ERROR_OK)
-		return ret;
-	reg &= ~CQSPI_REG_SIZE_ADDRESS_MASK;
-	reg |= (op->addr.nbytes - 1);
-	ret = cqspi_writel(bank, reg, CQSPI_REG_SIZE);
-	if (ret != ERROR_OK)
-		return ret;
-	return cqspi_readl_flush(bank, CQSPI_REG_SIZE); /* Flush posted write. */
+	return cqspi_set_addr_width(bank, op->addr.nbytes);
 }
 
 static int cqspi_indirect_read_execute(struct flash_bank *bank, uint8_t *rxbuf,
@@ -958,19 +1099,47 @@ static int cqspi_write_setup(struct flash_bank *bank, const struct cqspi_mem_op 
 	 * is nothing to do: the spi-nor layer polls the flash status itself.
 	 */
 
-	ret = cqspi_readl(bank, CQSPI_REG_SIZE, &reg);
-	if (ret != ERROR_OK)
-		return ret;
-	reg &= ~CQSPI_REG_SIZE_ADDRESS_MASK;
-	reg |= (op->addr.nbytes - 1);
-	ret = cqspi_writel(bank, reg, CQSPI_REG_SIZE);
-	if (ret != ERROR_OK)
-		return ret;
-	return cqspi_readl_flush(bank, CQSPI_REG_SIZE); /* Flush posted write. */
+	return cqspi_set_addr_width(bank, op->addr.nbytes);
 }
 
+/*
+ * Streaming writes (not in Linux, see cqspi_write_stream()): wait until the
+ * SRAM write partition has room, return the free space in bytes.
+ */
+static int cqspi_wait_wr_sram_space(struct flash_bank *bank, uint32_t *space_bytes)
+{
+	struct cqspi_flash_bank *cqspi = bank->driver_priv;
+	const uint32_t partition_words = cqspi->fifo_depth - cqspi->fifo_depth / 2;
+	int64_t timeout = timeval_ms() + CQSPI_TIMEOUT_MS;
+	uint32_t reg, fill;
+	int ret;
+
+	while (1) {
+		ret = cqspi_readl(bank, CQSPI_REG_SDRAMLEVEL, &reg);
+		if (ret != ERROR_OK)
+			return ret;
+
+		fill = (reg >> CQSPI_REG_SDRAMLEVEL_WR_LSB) & CQSPI_REG_SDRAMLEVEL_WR_MASK;
+		if (fill < partition_words) {
+			*space_bytes = (partition_words - fill) * cqspi->fifo_width;
+			return ERROR_OK;
+		}
+
+		if (timeval_ms() > timeout) {
+			LOG_ERROR("cqspi: Indirect write timeout, SRAM stays full");
+			return ERROR_TIMEOUT_REACHED;
+		}
+		keep_alive();
+	}
+}
+
+/*
+ * Linux: cqspi_indirect_write_execute(). With 'stream' set, n_tx may exceed
+ * the SRAM write partition: data is then written whenever there is room
+ * (see cqspi_write_stream()); otherwise this is the Linux code path.
+ */
 static int cqspi_indirect_write_execute(struct flash_bank *bank, uint32_t to_addr,
-		const uint8_t *txbuf, const uint32_t n_tx)
+		const uint8_t *txbuf, const uint32_t n_tx, bool stream)
 {
 	uint32_t remaining = n_tx;
 	uint32_t write_bytes;
@@ -1010,6 +1179,14 @@ static int cqspi_indirect_write_execute(struct flash_bank *bank, uint32_t to_add
 		uint32_t write_words, mod_bytes;
 
 		write_bytes = remaining;
+		if (stream) {
+			uint32_t space;
+
+			ret = cqspi_wait_wr_sram_space(bank, &space);
+			if (ret != ERROR_OK)
+				goto failwr;
+			write_bytes = MIN(remaining, space);
+		}
 		write_words = write_bytes / 4;
 		mod_bytes = write_bytes % 4;
 		/* Write 4 bytes at a time then single bytes. */
@@ -1034,14 +1211,38 @@ static int cqspi_indirect_write_execute(struct flash_bank *bank, uint32_t to_add
 		 * status is polled below instead.
 		 */
 		remaining -= write_bytes;
+		if (stream)
+			keep_alive();
 	}
 
-	/* Check indirect done status */
-	ret = cqspi_wait_for_bit(bank, CQSPI_REG_INDIRECTWR,
-			CQSPI_REG_INDIRECTWR_DONE_MASK, false);
-	if (ret != ERROR_OK) {
-		LOG_ERROR("cqspi: Indirect write completion error (%i)", ret);
+	/*
+	 * Fast path: by the time the data has made it through the debugger,
+	 * the controller has usually long finished writing it to the flash.
+	 * So read the indirect done status and the idle status (three times,
+	 * see cqspi_wait_idle()) in one batch. Linux checks idle only after
+	 * clearing the done status; register writes don't make the controller
+	 * busy, so if all of these show completion, the outcome is the same.
+	 */
+	static const uint32_t done_regs[] = {
+		CQSPI_REG_INDIRECTWR,
+		CQSPI_REG_CONFIG, CQSPI_REG_CONFIG, CQSPI_REG_CONFIG,
+	};
+	uint32_t vals[ARRAY_SIZE(done_regs)];
+
+	ret = cqspi_readl_multi(bank, done_regs, vals, ARRAY_SIZE(done_regs));
+	if (ret != ERROR_OK)
 		goto failwr;
+	bool fast_done = (vals[0] & CQSPI_REG_INDIRECTWR_DONE_MASK) &&
+		cqspi_all_idle(&vals[1], 3);
+
+	/* Check indirect done status */
+	if (!fast_done) {
+		ret = cqspi_wait_for_bit(bank, CQSPI_REG_INDIRECTWR,
+				CQSPI_REG_INDIRECTWR_DONE_MASK, false);
+		if (ret != ERROR_OK) {
+			LOG_ERROR("cqspi: Indirect write completion error (%i)", ret);
+			goto failwr;
+		}
 	}
 
 	/* Disable interrupt. */
@@ -1053,6 +1254,9 @@ static int cqspi_indirect_write_execute(struct flash_bank *bank, uint32_t to_add
 	ret = cqspi_writel(bank, CQSPI_REG_INDIRECTWR_DONE_MASK, CQSPI_REG_INDIRECTWR);
 	if (ret != ERROR_OK)
 		return ret;
+
+	if (fast_done)
+		return ERROR_OK;
 
 	return cqspi_wait_idle(bank);
 
@@ -1244,7 +1448,44 @@ static int cqspi_write(struct flash_bank *bank, const struct cqspi_mem_op *op)
 		return ret;
 
 	/* Direct (DAC) mode is disabled on SoCFPGA (CQSPI_DISABLE_DAC_MODE) */
-	return cqspi_indirect_write_execute(bank, op->addr.val, op->data.out, op->data.nbytes);
+	return cqspi_indirect_write_execute(bank, op->addr.val, op->data.out, op->data.nbytes,
+			false);
+}
+
+/*
+ * Multi-page ("streaming") write; not in Linux, where spi-nor issues one
+ * page program per page. The controller can program any number of pages
+ * with a single indirect write: it splits the data at page boundaries
+ * (using the page size in CQSPI_REG_SIZE), sends WRITE ENABLE before each
+ * page program (unless disabled in CQSPI_REG_WR_INSTR) and polls the flash
+ * status after each one (write completion polling, which cannot even be
+ * turned off on SoCFPGA, see CQSPI_NO_SUPPORT_WR_COMPLETION). For a
+ * debugger, where every round trip is expensive, this avoids the per-page
+ * WRITE ENABLE, completion and status polling round trips: the data is
+ * simply streamed into the SRAM FIFO whenever it has room.
+ *
+ * The caller checks the flash status afterwards; the flag status register
+ * error bits are sticky, so a failure of any page in the transfer is seen.
+ */
+static int cqspi_write_stream(struct flash_bank *bank, const struct cqspi_mem_op *op,
+		uint32_t page_size)
+{
+	int ret;
+
+	ret = cqspi_configure(bank);
+	if (ret != ERROR_OK)
+		return ret;
+
+	ret = cqspi_write_setup(bank, op);
+	if (ret != ERROR_OK)
+		return ret;
+
+	ret = cqspi_set_page_size(bank, page_size);
+	if (ret != ERROR_OK)
+		return ret;
+
+	return cqspi_indirect_write_execute(bank, op->addr.val, op->data.out, op->data.nbytes,
+			true);
 }
 
 static int cqspi_read(struct flash_bank *bank, const struct cqspi_mem_op *op)
@@ -1591,6 +1832,30 @@ static int spi_nor_page_program(struct flash_bank *bank, uint32_t addr,
 	return spi_nor_wait_till_ready(bank, SPI_NOR_READY_WAIT_MS);
 }
 
+/*
+ * Program 'len' bytes, possibly spanning many pages, with a single
+ * multi-page indirect write (see cqspi_write_stream()); the controller
+ * issues WRITE ENABLE and waits for completion for every page. Then check
+ * the flash status: this also reports errors of any page of the transfer,
+ * since the flag status register error bits are sticky.
+ */
+static int spi_nor_write_stream(struct flash_bank *bank, uint32_t addr,
+		const uint8_t *buf, uint32_t len)
+{
+	struct cqspi_flash_bank *cqspi = bank->driver_priv;
+	struct cqspi_mem_op op;
+	int retval;
+
+	spi_nor_op_init(&op, cqspi->dev.pprog_cmd);
+	spi_nor_op_addr(&op, cqspi->addr_nbytes, addr);
+	spi_nor_op_data_out(&op, buf, len);
+	retval = cqspi_write_stream(bank, &op, cqspi->dev.pagesize);
+	if (retval != ERROR_OK)
+		return retval;
+
+	return spi_nor_wait_till_ready(bank, SPI_NOR_READY_WAIT_MS);
+}
+
 static int spi_nor_read_data(struct flash_bank *bank, uint32_t addr, uint8_t *buf, uint32_t len)
 {
 	struct cqspi_flash_bank *cqspi = bank->driver_priv;
@@ -1753,6 +2018,17 @@ FLASH_BANK_COMMAND_HANDLER(cqspi_flash_bank_command)
 			COMMAND_PARSE_NUMBER(u32, CMD_ARGV[++i], cqspi->f_pdata.tchsh_ns);
 		} else if (strcmp(opt, "-tslch-ns") == 0) {
 			COMMAND_PARSE_NUMBER(u32, CMD_ARGV[++i], cqspi->f_pdata.tslch_ns);
+		} else if (strcmp(opt, "-write-mode") == 0) {
+			const char *mode = CMD_ARGV[++i];
+
+			if (strcmp(mode, "stream") == 0) {
+				cqspi->write_mode = CQSPI_WRITE_STREAM;
+			} else if (strcmp(mode, "page") == 0) {
+				cqspi->write_mode = CQSPI_WRITE_PAGE;
+			} else {
+				LOG_ERROR("cadence_qspi: unknown write mode '%s'", mode);
+				retval = ERROR_COMMAND_SYNTAX_ERROR;
+			}
 		} else {
 			LOG_ERROR("cadence_qspi: unknown argument '%s'", opt);
 			retval = ERROR_COMMAND_SYNTAX_ERROR;
@@ -1858,6 +2134,14 @@ static int cqspi_do_probe(struct flash_bank *bank)
 		bank->num_sectors = 0;
 		return ERROR_FAIL;
 	}
+
+	/*
+	 * alloc_block_array() marks the protection state as unknown (-1).
+	 * Protection is only handled in software by this driver (see
+	 * cqspi_protect()), so all sectors start out unprotected.
+	 */
+	for (unsigned int sector = 0; sector < bank->num_sectors; sector++)
+		bank->sectors[sector].is_protected = 0;
 
 	cqspi->probed = true;
 	return ERROR_OK;
@@ -1973,16 +2257,28 @@ static int cqspi_flash_write(struct flash_bank *bank, const uint8_t *buffer,
 		}
 	}
 
-	/* Page program, never crossing a page boundary (spi-nor write loop) */
 	const uint32_t page_size = cqspi->dev.pagesize;
 	cqspi_op_begin(bank);
 	while (count > 0) {
-		uint32_t page_remain = page_size - (offset % page_size);
-		uint32_t len = MIN(count, page_remain);
+		uint32_t len;
 
-		retval = spi_nor_page_program(bank, offset, buffer, len);
+		if (cqspi->write_mode == CQSPI_WRITE_PAGE) {
+			/* Page program, never crossing a page boundary (spi-nor write loop) */
+			uint32_t page_remain = page_size - (offset % page_size);
+
+			len = MIN(count, page_remain);
+			retval = spi_nor_page_program(bank, offset, buffer, len);
+		} else {
+			/*
+			 * Multi-page writes of up to CQSPI_STREAM_CHUNK bytes, so
+			 * that a failure is reported for a limited address range.
+			 */
+			len = MIN(count, CQSPI_STREAM_CHUNK - (offset % CQSPI_STREAM_CHUNK));
+			retval = spi_nor_write_stream(bank, offset, buffer, len);
+		}
 		if (retval != ERROR_OK) {
-			LOG_ERROR("cqspi: programming at offset 0x%08" PRIx32 " failed", offset);
+			LOG_ERROR("cqspi: programming 0x%08" PRIx32 "..0x%08" PRIx32 " failed",
+				offset, offset + len - 1);
 			break;
 		}
 
@@ -2097,9 +2393,66 @@ static int cqspi_get_info(struct flash_bank *bank, struct command_invocation *cm
 				cqspi->f_pdata.clk_rate, cqspi->master_ref_clk_hz);
 	else
 		command_print_sameline(cmd, "  SCLK: left as configured by boot firmware\n");
+	command_print_sameline(cmd, "  Write mode: %s\n", cqspi_write_mode_names[cqspi->write_mode]);
 
 	return ERROR_OK;
 }
+
+COMMAND_HANDLER(cqspi_handle_write_mode_command)
+{
+	struct flash_bank *bank;
+	int retval;
+
+	if (CMD_ARGC < 1 || CMD_ARGC > 2)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	retval = CALL_COMMAND_HANDLER(flash_command_get_bank_probe_optional, 0, &bank, false);
+	if (retval != ERROR_OK)
+		return retval;
+
+	if (bank->driver != &cadence_qspi_flash) {
+		command_print(CMD, "flash bank '%s' is not a cadence_qspi bank", bank->name);
+		return ERROR_FAIL;
+	}
+
+	struct cqspi_flash_bank *cqspi = bank->driver_priv;
+
+	if (CMD_ARGC == 2) {
+		if (strcmp(CMD_ARGV[1], "stream") == 0)
+			cqspi->write_mode = CQSPI_WRITE_STREAM;
+		else if (strcmp(CMD_ARGV[1], "page") == 0)
+			cqspi->write_mode = CQSPI_WRITE_PAGE;
+		else
+			return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+
+	command_print(CMD, "%s", cqspi_write_mode_names[cqspi->write_mode]);
+	return ERROR_OK;
+}
+
+static const struct command_registration cqspi_subcommand_handlers[] = {
+	{
+		.name = "write_mode",
+		.handler = cqspi_handle_write_mode_command,
+		.mode = COMMAND_ANY,
+		.usage = "bank_id ['stream'|'page']",
+		.help = "Show or select how data is programmed: 'stream' (default) "
+			"uses multi-page writes, 'page' programs page by page "
+			"like the Linux spi-nor layer.",
+	},
+	COMMAND_REGISTRATION_DONE
+};
+
+static const struct command_registration cqspi_command_handlers[] = {
+	{
+		.name = "cadence_qspi",
+		.mode = COMMAND_ANY,
+		.help = "Cadence QSPI flash command group",
+		.usage = "",
+		.chain = cqspi_subcommand_handlers,
+	},
+	COMMAND_REGISTRATION_DONE
+};
 
 const struct flash_driver cadence_qspi_flash = {
 	.name = "cadence_qspi",
@@ -2107,7 +2460,9 @@ const struct flash_driver cadence_qspi_flash = {
 		"[-ctrl-base <addr>] [-ahb-base <addr>] [-trigger-address <addr>] "
 		"[-fifo-depth <words>] [-fifo-width <bytes>] [-cs <n>] [-decoded-cs] "
 		"[-ref-clk <hz>] [-sclk <hz>] [-read-delay <n>] [-rclk-en] "
-		"[-tshsl-ns <ns>] [-tsd2d-ns <ns>] [-tchsh-ns <ns>] [-tslch-ns <ns>]",
+		"[-tshsl-ns <ns>] [-tsd2d-ns <ns>] [-tchsh-ns <ns>] [-tslch-ns <ns>] "
+		"[-write-mode stream|page]",
+	.commands = cqspi_command_handlers,
 	.flash_bank_command = cqspi_flash_bank_command,
 	.erase = cqspi_erase,
 	.protect = cqspi_protect,

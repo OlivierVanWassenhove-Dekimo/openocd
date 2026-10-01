@@ -425,13 +425,20 @@ static int adi_jtag_scan_inout_check_u32(struct adiv5_dap *dap,
 	return jtag_execute_queue();
 }
 
-static int jtagdp_overrun_check(struct adiv5_dap *dap)
+/*
+ * Execute the queued transactions and recover from WAIT responses.
+ * If not NULL, *wait_found is set when transactions had to be replayed.
+ */
+static int jtagdp_overrun_check(struct adiv5_dap *dap, bool *wait_found)
 {
 	int retval;
 	struct dap_cmd *el, *tmp, *prev = NULL;
 	int found_wait = 0;
 	int64_t time_now;
 	OOCD_LIST_HEAD(replay_list);
+
+	if (wait_found)
+		*wait_found = false;
 
 	/* make sure all queued transactions are complete */
 	retval = jtag_execute_queue();
@@ -644,25 +651,18 @@ static int jtagdp_overrun_check(struct adiv5_dap *dap)
 	}
 
  done:
+	if (wait_found)
+		*wait_found = found_wait;
 	flush_journal(dap, &replay_list);
 	flush_journal(dap, &dap->cmd_journal);
 	return retval;
 }
 
-static int jtagdp_transaction_endcheck(struct adiv5_dap *dap)
+/* Evaluate a DP CTRL/STAT value read at the end of a batch of transactions */
+static int jtagdp_check_ctrlstat(struct adiv5_dap *dap, uint32_t ctrlstat)
 {
-	int retval;
-	uint32_t ctrlstat, pwrmask;
-
-	/* too expensive to call keep_alive() here */
-
-	/* Post CTRL/STAT read; discard any previous posted read value
-	 * but collect its ACK status.
-	 */
-	retval = adi_jtag_scan_inout_check_u32(dap, JTAG_DP_DPACC,
-			DP_CTRL_STAT, DPAP_READ, 0, &ctrlstat, 0);
-	if (retval != ERROR_OK)
-		goto done;
+	int retval = ERROR_OK;
+	uint32_t pwrmask;
 
 	/* REVISIT also STICKYCMP, for pushed comparisons (nyet used) */
 
@@ -687,15 +687,32 @@ static int jtagdp_transaction_endcheck(struct adiv5_dap *dap)
 		retval = adi_jtag_scan_inout_check_u32(dap, JTAG_DP_DPACC,
 				DP_CTRL_STAT, DPAP_WRITE,
 				dap->dp_ctrl_stat | SSTICKYERR | SSTICKYORUN, NULL, 0);
-		if (retval != ERROR_OK)
-			goto done;
-
-		retval = ERROR_JTAG_DEVICE_ERROR;
+		if (retval == ERROR_OK)
+			retval = ERROR_JTAG_DEVICE_ERROR;
 	}
 
- done:
 	flush_journal(dap, &dap->cmd_journal);
 	return retval;
+}
+
+static int jtagdp_transaction_endcheck(struct adiv5_dap *dap)
+{
+	int retval;
+	uint32_t ctrlstat;
+
+	/* too expensive to call keep_alive() here */
+
+	/* Post CTRL/STAT read; discard any previous posted read value
+	 * but collect its ACK status.
+	 */
+	retval = adi_jtag_scan_inout_check_u32(dap, JTAG_DP_DPACC,
+			DP_CTRL_STAT, DPAP_READ, 0, &ctrlstat, 0);
+	if (retval != ERROR_OK) {
+		flush_journal(dap, &dap->cmd_journal);
+		return retval;
+	}
+
+	return jtagdp_check_ctrlstat(dap, ctrlstat);
 }
 
 /*--------------------------------------------------------------------------*/
@@ -876,12 +893,38 @@ static int jtag_dp_run(struct adiv5_dap *dap)
 {
 	int retval;
 	int retval2 = ERROR_OK;
+	uint32_t ctrlstat = 0;
+	bool wait_found = false;
 
 	retval = adi_jtag_finish_read(dap);
 	if (retval != ERROR_OK)
 		goto done;
-	retval2 = jtagdp_overrun_check(dap);
-	retval = jtagdp_transaction_endcheck(dap);
+
+	/*
+	 * Queue the CTRL/STAT read of the sticky error check behind the
+	 * transactions, so that both are executed with a single JTAG queue
+	 * execution. That is the same sequence of scans as executing the
+	 * transactions and then jtagdp_transaction_endcheck(), but saves an
+	 * adapter round trip, which is expensive with e.g. remote JTAG servers.
+	 * If WAIT recovery was needed, the replay invalidates this read; then,
+	 * as well as on errors, fall back to the separate end check.
+	 */
+	retval = adi_jtag_dp_scan_u32(dap, JTAG_DP_DPACC, DP_CTRL_STAT,
+			DPAP_READ, 0, NULL, 0, NULL);
+	if (retval == ERROR_OK)
+		retval = adi_jtag_dp_scan_u32(dap, JTAG_DP_DPACC, DP_RDBUFF,
+				DPAP_READ, 0, &ctrlstat, 0, NULL);
+	if (retval != ERROR_OK) {
+		retval2 = jtagdp_overrun_check(dap, NULL);
+		retval = jtagdp_transaction_endcheck(dap);
+		goto done;
+	}
+
+	retval2 = jtagdp_overrun_check(dap, &wait_found);
+	if (retval2 == ERROR_OK && !wait_found)
+		retval = jtagdp_check_ctrlstat(dap, ctrlstat);
+	else
+		retval = jtagdp_transaction_endcheck(dap);
 
  done:
 	return (retval2 != ERROR_OK) ? retval2 : retval;
@@ -889,7 +932,7 @@ static int jtag_dp_run(struct adiv5_dap *dap)
 
 static int jtag_dp_sync(struct adiv5_dap *dap)
 {
-	return jtagdp_overrun_check(dap);
+	return jtagdp_overrun_check(dap, NULL);
 }
 
 /* FIXME don't export ... just initialize as
