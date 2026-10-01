@@ -316,22 +316,51 @@ static int aji_client_read_buffer(
 }
 
 /**
+ * A scan whose captured data has to be handed back to OpenOCD.
+ *
+ * With deferred (packed) AJI commands the captured data is only valid after
+ * the AJI command queue has been flushed, so the buffers are kept until
+ * the end of #aji_client_execute_queue().
+ */
+struct aji_client_pending_read
+{
+	const struct scan_command *cmd;
+	BYTE *read_buffer;
+	DWORD bit_count;
+	DWORD ir_capture; // IR scans capture into a DWORD
+};
+
+/**
  * Handles IR and DR scans
  *
  * \pre #jtagservice_lock() locked the required TAP
  *
  * \param cmd Contains the detail about the scan operation
+ * \param pending On output, \c pending->cmd is set if the scan captures
+ *             data, which has to be completed with
+ *             #aji_client_complete_read() after the AJI commands have been
+ *             flushed. The caller must free \c pending->read_buffer.
+ *             Must not move in memory until then.
  */
-static int aji_client_scan(struct scan_command *const cmd)
+static int aji_client_scan(struct scan_command *const cmd,
+						   struct aji_client_pending_read *pending)
 {
 	DWORD bit_count = 0;
 	BYTE *write_buffer = NULL,
 		 *read_buffer = NULL;
 	char *log_buf = NULL;
 
-	aji_client_build_buffers(cmd, &bit_count, &write_buffer, &read_buffer);
+	pending->cmd = NULL;
+	pending->read_buffer = NULL;
 
-	if (write_buffer)
+	if (aji_client_build_buffers(cmd, &bit_count, &write_buffer, &read_buffer) != ERROR_OK)
+	{
+		free(write_buffer);
+		free(read_buffer);
+		return ERROR_FAIL;
+	}
+
+	if (write_buffer && LOG_LEVEL_IS(LOG_LVL_DEBUG_IO))
 	{
 		log_buf = hexdump(write_buffer, DIV_ROUND_UP(bit_count, 8));
 		LOG_DEBUG_IO("%s(scan=%s%s, type=OUT, bits=%lu, buf=[%s], end_state=%d)", __func__,
@@ -340,7 +369,7 @@ static int aji_client_scan(struct scan_command *const cmd)
 					 (long unsigned)bit_count, log_buf, cmd->end_state);
 		free(log_buf);
 	}
-	else
+	else if (!write_buffer)
 	{
 		LOG_DEBUG_IO("%s(scan=%s%s, type=OUT, no write,  end_state=%d)", __func__,
 					 cmd->tap_is_sld ? "Virtual " : "",
@@ -369,32 +398,31 @@ static int aji_client_scan(struct scan_command *const cmd)
 			instruction |= write_buffer[i] << (i * 8);
 		}
 
-		DWORD capture = 0;
+		// The capture may be filled in later, when the AJI commands are
+		// flushed, so it must live in *pending.
+		pending->ir_capture = 0;
 		if (cmd->tap_is_sld)
 		{
-			status = c_aji_access_overlay(open_id, instruction, read_buffer ? &capture : NULL);
+			status = c_aji_access_overlay(open_id, instruction,
+										  read_buffer ? &pending->ir_capture : NULL);
 		}
 		else
 		{
 			status = c_aji_access_ir(
-				open_id, instruction, read_buffer ? &capture : NULL, 0);
-		}
-
-		if (read_buffer)
-		{
-			for (DWORD i = 0; i < (bit_count + 7) / 8; i++)
-			{
-				read_buffer[i] = (BYTE)(capture >> (i * 8));
-			}
+				open_id, instruction, read_buffer ? &pending->ir_capture : NULL, 0);
 		}
 	}
 	else
 	{
-		c_aji_access_dr(
+		// When deferred, libaji_client copies write_buffer but fills
+		// read_buffer only once the commands are flushed.
+		status = c_aji_access_dr(
 			open_id, bit_count, AJI_DR_UNUSED_X,
 			0, write_buffer ? bit_count : 0, write_buffer,
 			0, read_buffer ? bit_count : 0, read_buffer);
 	} // end else-if (cmd->ir_scan)
+
+	free(write_buffer);
 
 	if (status != AJI_NO_ERROR)
 	{
@@ -402,46 +430,15 @@ static int aji_client_scan(struct scan_command *const cmd)
 				  cmd->tap_is_sld ? "Virtual " : "",
 				  cmd->ir_scan ? "IRSCAN" : "DRSCAN",
 				  status, c_aji_error_decode(status));
-		if (write_buffer)
-		{
-			free(write_buffer);
-		}
-		if (read_buffer)
-		{
-			free(read_buffer);
-		}
+		free(read_buffer);
 		return ERROR_FAIL;
 	}
 
 	if (read_buffer)
 	{
-		log_buf = hexdump(read_buffer, DIV_ROUND_UP(bit_count, 8));
-		LOG_DEBUG_IO("%s(scan=%s%s, type=IN, bits=%lu, buf=[%s], end_state=%d)", __func__,
-					 cmd->tap_is_sld ? "Virtual " : "",
-					 cmd->ir_scan ? "IRSCAN" : "DRSCAN",
-					 (long unsigned)bit_count, log_buf, cmd->end_state);
-		free(log_buf);
-	}
-	else
-	{
-		LOG_DEBUG_IO("%s(scan=%s%s, type=IN, no read,  end_state=%d)", __func__,
-					 cmd->tap_is_sld ? "Virtual " : "",
-					 cmd->ir_scan ? "IRSCAN" : "DRSCAN",
-					 cmd->end_state);
-	}
-
-	if (read_buffer)
-	{
-		aji_client_read_buffer(read_buffer, cmd);
-	}
-
-	if (write_buffer)
-	{
-		free(write_buffer);
-	}
-	if (read_buffer)
-	{
-		free(read_buffer);
+		pending->cmd = cmd;
+		pending->read_buffer = read_buffer;
+		pending->bit_count = bit_count;
 	}
 
 	if (TAP_IDLE != cmd->end_state)
@@ -463,6 +460,38 @@ static int aji_client_scan(struct scan_command *const cmd)
 
 	tap_set_state(TAP_IDLE); // Faking move to TAP_IDLE
 	return ERROR_OK;
+}
+
+/**
+ * Hand the data captured by a scan back to OpenOCD.
+ *
+ * \pre The AJI commands have been flushed, i.e. the captured data is valid.
+ */
+static void aji_client_complete_read(struct aji_client_pending_read *pending)
+{
+	const struct scan_command *cmd = pending->cmd;
+	BYTE *read_buffer = pending->read_buffer;
+	DWORD bit_count = pending->bit_count;
+
+	if (cmd->ir_scan)
+	{
+		for (DWORD i = 0; i < (bit_count + 7) / 8; i++)
+		{
+			read_buffer[i] = (BYTE)(pending->ir_capture >> (i * 8));
+		}
+	}
+
+	if (LOG_LEVEL_IS(LOG_LVL_DEBUG_IO))
+	{
+		char *log_buf = hexdump(read_buffer, DIV_ROUND_UP(bit_count, 8));
+		LOG_DEBUG_IO("%s(scan=%s%s, type=IN, bits=%lu, buf=[%s], end_state=%d)", __func__,
+					 cmd->tap_is_sld ? "Virtual " : "",
+					 cmd->ir_scan ? "IRSCAN" : "DRSCAN",
+					 (long unsigned)bit_count, log_buf, cmd->end_state);
+		free(log_buf);
+	}
+
+	aji_client_read_buffer(read_buffer, cmd);
 }
 
 /**
@@ -495,6 +524,29 @@ int aji_client_execute_queue(struct jtag_command *cmd_queue)
 	if (cmd_queue == NULL)
 	{
 		return ERROR_OK;
+	}
+
+	// Captured scan data is only valid once the AJI commands have been
+	// flushed (see jtagservice_tap_pack_style), so keep track of all scans
+	// with captures and complete them at the end. The array is sized up front
+	// because libaji_client may hold pointers into it.
+	unsigned int scan_count = 0;
+	for (struct jtag_command *cmd = cmd_queue; cmd != NULL; cmd = cmd->next)
+	{
+		if (cmd->type == JTAG_SCAN)
+			scan_count++;
+	}
+
+	struct aji_client_pending_read *pending = NULL;
+	unsigned int pending_count = 0;
+	if (scan_count)
+	{
+		pending = calloc(scan_count, sizeof(*pending));
+		if (pending == NULL)
+		{
+			LOG_ERROR("Insufficient memory for JTAG queue");
+			return ERROR_FAIL;
+		}
 	}
 
 	struct jtag_tap *tap = NULL;
@@ -549,7 +601,9 @@ int aji_client_execute_queue(struct jtag_command *cmd_queue)
 			assert(0); // deliberately assert() to be able to see where the error is, if it occurs
 			break;
 		case JTAG_SCAN:
-			ret = aji_client_scan(cmd->cmd.scan);
+			ret = aji_client_scan(cmd->cmd.scan, &pending[pending_count]);
+			if (pending[pending_count].cmd)
+				pending_count++;
 			break;
 		default:
 			LOG_ERROR("BUG: unknown JTAG command type 0x%X",
@@ -558,7 +612,25 @@ int aji_client_execute_queue(struct jtag_command *cmd_queue)
 			break;
 		}
 	}
-	jtagservice_unlock();
+
+	// Unlocking flushes all deferred AJI commands, which makes the captured
+	// data valid and reports errors of deferred commands.
+	AJI_ERROR status = jtagservice_unlock();
+	if (status != AJI_NO_ERROR)
+	{
+		LOG_ERROR("JTAG queue execution failed. Return status is %d (%s)",
+				  status, c_aji_error_decode(status));
+		ret = ERROR_FAIL;
+	}
+
+	for (unsigned int i = 0; i < pending_count; i++)
+	{
+		if (ret == ERROR_OK)
+			aji_client_complete_read(&pending[i]);
+		free(pending[i].read_buffer);
+	}
+	free(pending);
+
 	return ret;
 }
 
@@ -574,7 +646,37 @@ static const struct command_registration vjtag_subcommand_handlers[] = {
 	},
 	COMMAND_REGISTRATION_DONE}; // end vjtag_subcommand_handlers
 
+COMMAND_HANDLER(aji_client_handle_pack_style_command)
+{
+	if (CMD_ARGC > 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	if (CMD_ARGC == 1)
+	{
+		if (strcmp(CMD_ARGV[0], "manual") == 0)
+			jtagservice_set_tap_pack_style(AJI_PACK_MANUAL);
+		else if (strcmp(CMD_ARGV[0], "auto") == 0)
+			jtagservice_set_tap_pack_style(AJI_PACK_AUTO);
+		else
+			return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+
+	command_print(CMD, "%s",
+				  jtagservice_get_tap_pack_style() == AJI_PACK_MANUAL ? "manual" : "auto");
+	return ERROR_OK;
+}
+
 static const struct command_registration aji_client_subcommand_handlers[] = {
+	{
+		.name = "pack_style",
+		.handler = &aji_client_handle_pack_style_command,
+		.mode = COMMAND_ANY,
+		.help = "Select how JTAG scans are sent to the JTAG server: "
+				"'manual' (default) packs all scans of a JTAG queue, "
+				"'auto' sends every scan capturing data synchronously "
+				"(slow, previous behaviour)",
+		.usage = "[manual|auto]",
+	},
 	{
 		/*
 		 * This is a duplication of "hardware" top level command
@@ -594,7 +696,7 @@ static const struct command_registration aji_client_subcommand_handlers[] = {
 static const struct command_registration aji_client_command_handlers[] = {
 	{
 		.name = "aji_client",
-		.mode = COMMAND_CONFIG,
+		.mode = COMMAND_ANY,
 		.help = "Perform aji_client management",
 		.usage = "",
 		.chain = aji_client_subcommand_handlers,

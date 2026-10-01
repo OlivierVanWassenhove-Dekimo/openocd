@@ -86,6 +86,20 @@ used by opencod.exe.
 CHANGE LOG
 ==========
 
+unreleased:
+    - Performance: JTAG scans of a whole OpenOCD JTAG queue are
+	  now packed (AJI_PACK_MANUAL) instead of sending every scan
+	  that captures data to jtagd synchronously (AJI_PACK_AUTO).
+	  As every ARM DAP scan captures its ACK, previously every
+	  DAP access cost one host <-> jtagd round trip. Applies to
+	  hardware TAPs; virtual (SLD) TAPs are unchanged.
+	  The previous behaviour can be selected at any time with
+	      aji_client pack_style auto
+	  ('aji_client pack_style' prints the current setting,
+	  'aji_client pack_style manual' restores the default).
+    - Errors of scans and of the end-of-queue flush are now
+	  reported to OpenOCD instead of being ignored.
+
 0.11.0-R24.2:
     - Bugfix: If you have 8 or more SLD nodes, then
 	  previously opencod can segfault as the code

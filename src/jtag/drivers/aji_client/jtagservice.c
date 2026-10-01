@@ -284,6 +284,29 @@ struct jtagservice_record
 };
 static struct jtagservice_record jtagservice;
 
+/*
+ * Packing style used when locking a (non-virtual) TAP.
+ *
+ * With AJI_PACK_AUTO, libaji_client sends every scan that captures data
+ * (i.e. every ARM DAP scan, which always captures the ACK) to the JTAG
+ * server synchronously, costing one host <-> jtagd round trip per scan.
+ * With AJI_PACK_MANUAL such scans are deferred and packed as well; their
+ * captured data becomes valid once the commands are flushed, which
+ * aji_client_execute_queue() does (via jtagservice_unlock()) before it
+ * hands the data back to OpenOCD.
+ */
+static AJI_PACK_STYLE jtagservice_tap_pack_style = AJI_PACK_MANUAL;
+
+void jtagservice_set_tap_pack_style(AJI_PACK_STYLE style)
+{
+	jtagservice_tap_pack_style = style;
+}
+
+AJI_PACK_STYLE jtagservice_get_tap_pack_style(void)
+{
+	return jtagservice_tap_pack_style;
+}
+
 //=====================================
 // JTAG TAP management service
 //=====================================
@@ -517,8 +540,11 @@ AJI_ERROR jtagservice_unlock()
 					status,
 					c_aji_error_decode(status));
 	}
-	status = jtagservice_update_active_tap_record(0, (unsigned long)UINT32_MAX, false, UINT32_MAX);
-	return AJI_NO_ERROR;
+	jtagservice_update_active_tap_record(0, (unsigned long)UINT32_MAX, false, UINT32_MAX);
+
+	// Unlock flushes all deferred commands, so this also reports errors of
+	// commands which were packed (see jtagservice_tap_pack_style).
+	return status;
 }
 
 /**
@@ -610,7 +636,8 @@ static AJI_ERROR jtagservice_lock_jtag_tap(
 		}
 	} // end if (!jtagservice.device_open_id_list[tap_index])
 
-	status = c_aji_lock(jtagservice.device_open_id_list[tap_index], JTAGSERVICE_TIMEOUT_MS, AJI_PACK_AUTO);
+	status = c_aji_lock(jtagservice.device_open_id_list[tap_index], JTAGSERVICE_TIMEOUT_MS,
+						jtagservice_tap_pack_style);
 	if (!(AJI_NO_ERROR == status || AJI_LOCKED == status))
 	{
 		LOG_ERROR("Cannot lock tap %lu idcode=0x%08lX. Returned %d (%s)",

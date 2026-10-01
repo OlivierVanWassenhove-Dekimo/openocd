@@ -59,6 +59,15 @@ AJI_ERROR jtagservice_lock(const struct jtag_tap* const tap);
 AJI_ERROR jtagservice_unlock(void);
 
 /**
+ * Packing style used when locking a (non-virtual) TAP: #AJI_PACK_MANUAL
+ * (default) defers and packs all scans until the end of a JTAG queue,
+ * #AJI_PACK_AUTO sends every scan that captures data synchronously.
+ * Takes effect at the next lock, i.e. the next JTAG queue execution.
+ */
+void jtagservice_set_tap_pack_style(AJI_PACK_STYLE style);
+AJI_PACK_STYLE jtagservice_get_tap_pack_style(void);
+
+/**
  * Get the OPEN ID of the currently in use (locked) TAP/SLD node
  *
  * \return The #AJI_OPEN_ID of the TAP/SLD node in use.
