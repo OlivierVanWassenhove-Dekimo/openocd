@@ -55,6 +55,8 @@ static int aarch64_virt2phys(struct target *target,
 	target_addr_t virt, target_addr_t *phys);
 static int aarch64_read_cpu_memory(struct target *target,
 	uint64_t address, uint32_t size, uint32_t count, uint8_t *buffer);
+static int aarch64_write_cpu_memory(struct target *target,
+	uint64_t address, uint32_t size, uint32_t count, const uint8_t *buffer);
 
 static int aarch64_restore_system_control_reg(struct target *target)
 {
@@ -554,6 +556,7 @@ static int aarch64_poll_smp(struct target *target, bool smp,
 		return retval;
 
 	if (armv8->sticky_reset) {
+		target_to_aarch64(target)->psci_reset_active = false;
 		armv8->sticky_reset = false;
 		if (target->state != TARGET_RESET) {
 			target->state = TARGET_RESET;
@@ -923,6 +926,10 @@ static int aarch64_resume(struct target *target, bool current,
 	struct armv8_common *armv8 = target_to_armv8(target);
 	armv8->last_run_control_op = ARMV8_RUNCONTROL_RESUME;
 
+	if (target_to_aarch64(target)->psci_reset_active) {
+		LOG_TARGET_ERROR(target, "PSCI reset unresolved; cold reset may be required before resume");
+		return ERROR_TARGET_FAILURE;
+	}
 	if (target->state != TARGET_HALTED) {
 		LOG_TARGET_ERROR(target, "not halted");
 		return ERROR_TARGET_NOT_HALTED;
@@ -1175,6 +1182,11 @@ static int aarch64_step(struct target *target, bool current, target_addr_t addre
 	uint32_t edecr;
 
 	armv8->last_run_control_op = ARMV8_RUNCONTROL_STEP;
+
+	if (aarch64->psci_reset_active) {
+		LOG_TARGET_ERROR(target, "Cannot step an unresolved PSCI reset; cold reset may be required");
+		return ERROR_TARGET_FAILURE;
+	}
 
 	if (target->state != TARGET_HALTED) {
 		LOG_TARGET_ERROR(target, "not halted");
@@ -1954,7 +1966,7 @@ static int aarch64_hit_watchpoint(struct target *target,
 }
 
 /*
- * Cortex-A8 Reset functions
+ * AArch64 reset functions
  */
 
 static int aarch64_enable_reset_catch(struct target *target, bool enable)
@@ -2007,6 +2019,408 @@ static int aarch64_clear_reset_catch(struct target *target)
 	return ERROR_OK;
 }
 
+/* PSCI v1.1 SYSTEM_RESET2, architectural warm reset, unused cookie. */
+#define AARCH64_PSCI_SYSTEM_RESET2 UINT32_C(0xc4000012)
+#define AARCH64_PSCI_RESET_TIMEOUT_MS 5000
+#define AARCH64_RESET_TRAMPOLINE_SIZE 64
+#define AARCH64_PSCI_RETURN_OFFSET 24
+
+/* Execute SMC outside Debug state. This stub needs no stack, literal pool,
+ * application symbols or data accesses. HLT/loop preserves x0 on PSCI return.
+ * AArch64 instruction bytes are little-endian irrespective of SCTLR.EE.
+ */
+static const uint32_t aarch64_psci_reset_code[] = {
+	ARMV8_DSB_SY,
+	0xd2800000 | ((AARCH64_PSCI_SYSTEM_RESET2 & 0xffff) << 5), /* movz x0, #0x12 */
+	0xf2a00000 | ((AARCH64_PSCI_SYSTEM_RESET2 >> 16) << 5), /* movk x0, #0xc400, lsl #16 */
+	0xaa1f03e1, /* mov x1, xzr: architectural warm reset */
+	0xaa1f03e2, /* mov x2, xzr: cookie */
+	ARMV8_SMC(0),
+	ARMV8_HLT(11),
+	0x17ffffff, /* b .-4: trap again if the debugger resumes the HLT */
+};
+
+/* Called with the caller's stage-1 MMU disabled. Clean BEFORE uncached stores
+ * so an old dirty line cannot later overwrite the stub, and AFTER for PoC.
+ */
+static int aarch64_psci_clean_reset_code(struct target *target, uint32_t line_size)
+{
+	struct aarch64_common *aarch64 = target_to_aarch64(target);
+	struct arm_dpm *dpm = &aarch64->armv8_common.dpm;
+	target_addr_t end = aarch64->reset_trampoline + sizeof(aarch64_psci_reset_code);
+	target_addr_t addr = aarch64->reset_trampoline & ~((target_addr_t)line_size - 1);
+
+	for (;;) {
+		int retval = dpm->instr_write_data_r0_64(dpm, ARMV8_SYS(SYSTEM_DCCIVAC, 0), addr);
+		if (retval != ERROR_OK)
+			return retval;
+		/* Avoid wrapping at the top of the address space on the final line. */
+		if (end - addr <= line_size)
+			break;
+		addr += line_size;
+	}
+	return dpm->instr_execute(dpm, ARMV8_DSB_SY);
+}
+
+/* Disabling EL1 stage-1 translation does not bypass EL2 translation or its
+ * forced memory attributes. Refuse these regimes instead of writing an IPA
+ * that might alias unrelated physical memory. DCPS2 never enters EL3.
+ */
+static int aarch64_psci_check_el2(struct target *target, uint32_t cpsr)
+{
+	struct armv8_common *armv8 = target_to_armv8(target);
+	struct arm_dpm *dpm = &armv8->dpm;
+	uint64_t pfr, hcr;
+	int retval;
+
+	if (dpm->last_el != SYSTEM_CUREL_EL1)
+		return ERROR_OK;
+	retval = dpm->instr_read_data_r0_64(dpm, ARMV8_MRS(SYSTEM_ID_AA64PFR0_EL1, 0), &pfr);
+	if (retval != ERROR_OK || ((pfr >> 8) & 0xf) == 0)
+		return retval; /* EL2 not implemented */
+	retval = armv8_dpm_modeswitch(dpm, ARMV8_64_EL2H);
+	if (retval != ERROR_OK)
+		return retval;
+	if (armv8_dpm_get_core_state(dpm) != ARM_STATE_AARCH64)
+		return ERROR_FAIL;
+	retval = dpm->instr_read_data_r0_64(dpm, ARMV8_MRS(SYSTEM_HCR_EL2, 0), &hcr);
+	if (retval != ERROR_OK)
+		return retval;
+	/* DCPS2 made SPSR_EL2 UNKNOWN; install a valid return before DRPS. */
+	retval = dpm->instr_write_data_r0_64(dpm, ARMV8_MSR_GP(SYSTEM_SPSR_EL2, 0), cpsr);
+	if (retval == ERROR_OK)
+		retval = dpm->instr_execute(dpm, ARMV8_DRPS);
+	armv8->arm.pc->dirty = true;
+	armv8->arm.cpsr->dirty = true;
+	if (retval != ERROR_OK)
+		return retval;
+	if (dpm->last_el != SYSTEM_CUREL_EL1)
+		return ERROR_FAIL;
+	if (hcr & (BIT(0) | BIT(12) | BIT(19) | BIT(27))) { /* VM, DC, TSC, TGE */
+		LOG_TARGET_ERROR(target, "EL1 PSCI trampoline requires HCR_EL2.VM/DC/TSC/TGE=0: "
+				"HCR_EL2=0x%016" PRIx64, hcr);
+		return ERROR_FAIL;
+	}
+	return ERROR_OK;
+}
+
+static int aarch64_write_psci_reset_code(struct target *target)
+{
+	struct aarch64_common *aarch64 = target_to_aarch64(target);
+	struct arm_dpm *dpm = &aarch64->armv8_common.dpm;
+	uint8_t code[sizeof(aarch64_psci_reset_code)], readback[sizeof(code)];
+	uint32_t ctr;
+	int retval;
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(aarch64_psci_reset_code); i++)
+		h_u32_to_le(code + 4 * i, aarch64_psci_reset_code[i]);
+
+	retval = dpm->instr_read_data_r0(dpm, ARMV8_MRS(SYSTEM_CTR, 0), &ctr);
+	if (retval != ERROR_OK)
+		return retval;
+	uint32_t line_size = 4U << ((ctr >> 16) & 0xf);
+	retval = aarch64_psci_clean_reset_code(target, line_size);
+	if (retval == ERROR_OK)
+		retval = aarch64_write_cpu_memory(target, aarch64->reset_trampoline, 1, sizeof(code), code);
+	if (retval != ERROR_OK) {
+		LOG_TARGET_ERROR(target, "Cannot write PSCI trampoline; verify reserved RAM permits non-secure CPU access");
+		return retval;
+	}
+	if (retval == ERROR_OK)
+		retval = aarch64_psci_clean_reset_code(target, line_size);
+	if (retval == ERROR_OK)
+		retval = aarch64_read_cpu_memory(target, aarch64->reset_trampoline, 1, sizeof(readback), readback);
+	if (retval != ERROR_OK)
+		return retval;
+	if (memcmp(code, readback, sizeof(code))) {
+		LOG_TARGET_ERROR(target, "PSCI reset trampoline readback mismatch");
+		return ERROR_FAIL;
+	}
+	retval = dpm->instr_execute(dpm, ARMV8_SYS(SYSTEM_ICIALLU, 31));
+	if (retval == ERROR_OK)
+		retval = dpm->instr_execute(dpm, ARMV8_DSB_SY);
+	if (retval == ERROR_OK)
+		retval = dpm->instr_execute(dpm, ARMV8_ISB);
+	return retval;
+}
+
+/* Roll back setup failures BEFORE restart, including debug memory faults. */
+static int aarch64_psci_reset_restore(struct target *target)
+{
+	struct armv8_common *armv8 = target_to_armv8(target);
+	struct arm_dpm *dpm = &armv8->dpm;
+	uint32_t cpsr = buf_get_u32(armv8->arm.cpsr->value, 0, 32);
+	unsigned int original_el = (cpsr >> 2) & 3;
+	int retval = mem_ap_write_atomic_u32(armv8->debug_ap,
+			armv8->debug_base + CPUV8_DBG_DRCR, DRCR_CSE);
+
+	if (retval == ERROR_OK)
+		retval = dpm->prepare(dpm);
+	if (retval == ERROR_OK && armv8_dpm_get_core_state(dpm) != ARM_STATE_AARCH64)
+		retval = ERROR_FAIL;
+	if (retval == ERROR_OK) {
+		static const unsigned int clobbered[3][3] = {
+			{ ARMV8_ELR_EL1, ARMV8_ESR_EL1, ARMV8_SPSR_EL1 },
+			{ ARMV8_ELR_EL2, ARMV8_ESR_EL2, ARMV8_SPSR_EL2 },
+			{ ARMV8_ELR_EL3, ARMV8_ESR_EL3, ARMV8_SPSR_EL3 },
+		};
+		/* A debug memory fault may clobber the caller's exception state.
+		 * Restore it too, especially when originally halted inside an ISR.
+		 */
+		if (dpm->last_el >= SYSTEM_CUREL_EL1 && dpm->last_el <= SYSTEM_CUREL_EL3) {
+			for (unsigned int i = 0; i < ARRAY_SIZE(clobbered[0]); i++)
+				armv8->arm.core_cache->reg_list[clobbered[dpm->last_el - 1][i]].dirty = true;
+		}
+		if (dpm->last_el > original_el) {
+			uint32_t spsr = dpm->last_el == SYSTEM_CUREL_EL3 ? SYSTEM_SPSR_EL3 : SYSTEM_SPSR_EL2;
+			retval = dpm->instr_write_data_r0_64(dpm, ARMV8_MSR_GP(spsr, 0), cpsr);
+			if (retval == ERROR_OK)
+				retval = dpm->instr_execute(dpm, ARMV8_DRPS);
+		}
+		if (retval == ERROR_OK && dpm->last_el != original_el)
+			retval = ERROR_FAIL;
+	}
+	dpm->finish(dpm);
+
+	for (unsigned int i = 0; i <= 2; i++)
+		armv8_reg_current(&armv8->arm, i)->dirty = true;
+	armv8->arm.pc->dirty = true;
+	armv8->arm.cpsr->dirty = true;
+	if (retval == ERROR_OK)
+		retval = aarch64_restore_system_control_reg(target);
+	if (retval == ERROR_OK)
+		retval = armv8_dpm_write_dirty_registers(dpm, true);
+	return retval;
+}
+
+static int aarch64_wait_psci_reset(struct target *target)
+{
+	struct armv8_common *armv8 = target_to_armv8(target);
+	bool left_debug = false;
+	int64_t then = timeval_ms();
+
+	for (;;) {
+		uint32_t prsr, dscr;
+		int retval = aarch64_read_prsr(target, &prsr);
+		if (retval != ERROR_OK)
+			return retval;
+		if (armv8->sticky_reset)
+			return ERROR_OK;
+		retval = mem_ap_read_atomic_u32(armv8->debug_ap,
+				armv8->debug_base + CPUV8_DBG_DSCR, &dscr);
+		if (retval != ERROR_OK)
+			return retval;
+		left_debug |= !(prsr & PRSR_HALT) || (prsr & PRSR_SDR);
+		/* EDESR.RC was cleared before restart: require a fresh Reset Catch. */
+		if ((prsr & PRSR_HALT) && DSCR_ENTRY(dscr) == DSCRV8_ENTRY_RESET_CATCH) {
+			uint32_t edesr;
+			retval = mem_ap_read_atomic_u32(armv8->debug_ap,
+					armv8->debug_base + CPUV8_DBG_EDESR, &edesr);
+			if (retval != ERROR_OK)
+				return retval;
+			if (left_debug || (edesr & ESR_RC))
+				return ERROR_OK;
+		}
+		if (left_debug && (prsr & PRSR_HALT)) {
+			LOG_TARGET_ERROR(target, "PSCI SYSTEM_RESET2 halted before reset: EDSCR=0x%08" PRIx32, dscr);
+			return ERROR_TARGET_FAILURE;
+		}
+		if (timeval_ms() > then + AARCH64_PSCI_RESET_TIMEOUT_MS) {
+			LOG_TARGET_ERROR(target, "Timeout waiting for PSCI SYSTEM_RESET2: "
+					"EDPRSR=0x%08" PRIx32 " EDSCR=0x%08" PRIx32, prsr, dscr);
+			return ERROR_TARGET_TIMEOUT;
+		}
+		keep_alive();
+	}
+}
+
+static int aarch64_psci_reset(struct target *target)
+{
+	struct aarch64_common *aarch64 = target_to_aarch64(target);
+	struct armv8_common *armv8 = &aarch64->armv8_common;
+	struct arm_dpm *dpm = &armv8->dpm;
+	uint32_t edecr, cpsr;
+	uint64_t pc;
+	int retval;
+
+	if (!target_was_examined(target)) {
+		LOG_TARGET_ERROR(target, "PSCI reset requires an examined target");
+		return ERROR_TARGET_NOT_EXAMINED;
+	}
+	if (target->smp || armv8->is_armv8r) {
+		LOG_TARGET_ERROR(target, "PSCI reset is supported only for a single AArch64 core");
+		return ERROR_FAIL;
+	}
+	if (!aarch64->reset_trampoline_set) {
+		LOG_TARGET_ERROR(target, "Configure reserved RAM with 'aarch64 reset_trampoline <physical_address>'");
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	}
+	for (struct breakpoint *bp = target->breakpoints; bp; bp = bp->next) {
+		if (bp->address >= aarch64->reset_trampoline &&
+				bp->address < aarch64->reset_trampoline + AARCH64_RESET_TRAMPOLINE_SIZE) {
+			LOG_TARGET_ERROR(target, "Remove breakpoint in PSCI reset trampoline at " TARGET_ADDR_FMT, bp->address);
+			return ERROR_FAIL;
+		}
+	}
+	retval = aarch64_poll_smp(target, false, false);
+	if (retval != ERROR_OK)
+		return retval;
+	if (aarch64->psci_reset_active) {
+		LOG_TARGET_ERROR(target, "Previous PSCI reset is unresolved; cold reset may be required");
+		return ERROR_TARGET_FAILURE;
+	}
+	if (target->state != TARGET_HALTED) {
+		retval = aarch64_halt_one(target, HALT_SYNC);
+		if (retval == ERROR_OK)
+			retval = aarch64_poll_smp(target, false, false);
+		if (retval != ERROR_OK)
+			return retval;
+	}
+	if (target->state != TARGET_HALTED)
+		return ERROR_TARGET_NOT_HALTED;
+
+	retval = dpm->prepare(dpm);
+	if (retval != ERROR_OK)
+		return retval;
+	cpsr = buf_get_u32(armv8->arm.cpsr->value, 0, 32);
+	pc = buf_get_u64(armv8->arm.pc->value, 0, 64);
+	if (armv8_dpm_get_core_state(dpm) != ARM_STATE_AARCH64 || !(dpm->dscr & BIT(13)) ||
+			(dpm->dscr & BIT(16)) || !(dpm->dscr & BIT(18)) ||
+			(dpm->last_el != SYSTEM_CUREL_EL1 && dpm->last_el != SYSTEM_CUREL_EL2) ||
+			((cpsr & 0x1e) != ARMV8_64_EL1T && (cpsr & 0x1e) != ARMV8_64_EL2T) ||
+			((cpsr >> 2) & 3) != dpm->last_el || (pc & 3)) {
+		LOG_TARGET_ERROR(target, "PSCI reset requires non-secure AArch64 EL1/EL2 and AArch64 EL3 debug access; "
+				"TF-A's PSCI runtime must already be initialized");
+		dpm->finish(dpm);
+		return ERROR_FAIL;
+	}
+	dpm->finish(dpm);
+
+	retval = mem_ap_read_atomic_u32(armv8->debug_ap,
+			armv8->debug_base + CPUV8_DBG_EDECR, &edecr);
+	if (retval != ERROR_OK)
+		return retval;
+	/* Preserve banked return state BEFORE a scratch-RAM access can fault.
+	 * These registers are not normally populated by debug_entry().
+	 */
+	static const unsigned int saved_bank[2][3] = {
+		{ ARMV8_ELR_EL1, ARMV8_ESR_EL1, ARMV8_SPSR_EL1 },
+		{ ARMV8_ELR_EL2, ARMV8_ESR_EL2, ARMV8_SPSR_EL2 },
+	};
+	for (unsigned int i = 0; i < ARRAY_SIZE(saved_bank[0]); i++) {
+		struct reg *reg = armv8_reg_current(&armv8->arm, saved_bank[dpm->last_el - 1][i]);
+		if (!reg->valid) {
+			retval = reg->type->get(reg);
+			if (retval != ERROR_OK)
+				goto restore_context;
+		}
+	}
+
+	/* Commit cached edits before preparing the physical stub. Keep the cache
+	 * for setup rollback; never restore it after the internal restart.
+	 */
+	retval = aarch64_restore_system_control_reg(target);
+	if (retval == ERROR_OK)
+		retval = armv8_dpm_write_dirty_registers(dpm, true);
+	if (retval == ERROR_OK)
+		retval = dpm->prepare(dpm);
+	if (retval != ERROR_OK)
+		goto restore_context;
+	armv8_reg_current(&armv8->arm, 0)->dirty = true;
+	retval = aarch64_psci_check_el2(target, cpsr);
+	if (retval != ERROR_OK)
+		goto restore_context;
+	/* Disable only the caller's stage-1 MMU/I-cache for physical fetch.
+	 * Leave D-cache contents and ALL EL3 runtime state intact. EL1 callers
+	 * must not have active stage-2 translation or forced cacheability.
+	 */
+	uint32_t sctlr = dpm->last_el == SYSTEM_CUREL_EL1 ? SYSTEM_SCTLR_EL1 : SYSTEM_SCTLR_EL2;
+	retval = dpm->instr_execute(dpm, ARMV8_DSB_SY);
+	if (retval == ERROR_OK) {
+		aarch64->system_control_reg_curr = aarch64->system_control_reg & ~(BIT(0) | BIT(12));
+		retval = dpm->instr_write_data_r0_64(dpm, ARMV8_MSR_GP(sctlr, 0), aarch64->system_control_reg_curr);
+	}
+	if (retval == ERROR_OK)
+		retval = dpm->instr_execute(dpm, ARMV8_ISB);
+	if (retval == ERROR_OK)
+		retval = aarch64_write_psci_reset_code(target);
+	if (retval == ERROR_OK)
+		retval = dpm->instr_write_data_r0_64(dpm, ARMV8_MSR_DLR(0), aarch64->reset_trampoline);
+	if (retval == ERROR_OK)
+		retval = dpm->instr_write_data_r0(dpm, ARMV8_MSR_DSPSR(0),
+				(cpsr | SYSTEM_DAIF_MASK) & ~BIT(21)); /* clear PSTATE.SS */
+	if (retval == ERROR_OK)
+		retval = dpm->instr_execute(dpm, ARMV8_ISB);
+	if (retval == ERROR_OK)
+		retval = aarch64_clear_reset_catch(target);
+	if (retval == ERROR_OK)
+		retval = mem_ap_write_atomic_u32(armv8->debug_ap,
+				armv8->debug_base + CPUV8_DBG_EDECR, edecr & ~BIT(2));
+	if (retval == ERROR_OK)
+		retval = aarch64_enable_reset_catch(target, target->reset_halt);
+	if (retval == ERROR_OK)
+		retval = aarch64_prepare_restart_one(target);
+	if (retval != ERROR_OK)
+		goto restore_context;
+	armv8->sticky_reset = false;
+	dpm->finish(dpm);
+
+	LOG_TARGET_INFO(target, "Executing PSCI SMC trampoline at " TARGET_ADDR_FMT
+			" (x0=0xc4000012 x1=0 x2=0)", aarch64->reset_trampoline);
+	aarch64->psci_reset_active = true;
+	armv8->last_run_control_op = ARMV8_RUNCONTROL_RESUME;
+	/* Internal restart: no application 'resumed' event / second CTI pulse. */
+	retval = aarch64_do_restart_one(target, RESTART_LAZY);
+	if (retval == ERROR_OK)
+		retval = aarch64_wait_psci_reset(target);
+	if (retval == ERROR_OK)
+		return target_to_aarch64(target)->psci_reset_active = false;
+
+	/* Firmware may have partially reset the system. Halt the real execution
+	 * state; never restore/resume the pre-SMC application after restart.
+	 */
+	if (aarch64_enable_reset_catch(target, true) != ERROR_OK)
+		LOG_TARGET_WARNING(target, "Could not retain Reset Catch after PSCI reset failure");
+	int halt_retval = aarch64_halt_one(target, HALT_SYNC);
+	if (armv8->sticky_reset)
+		return target_to_aarch64(target)->psci_reset_active = false;
+	if (halt_retval == ERROR_OK) {
+		register_cache_invalidate(armv8->arm.core_cache);
+		register_cache_invalidate(armv8->arm.core_cache->next);
+		target->state = TARGET_RUNNING;
+		halt_retval = aarch64_poll_smp(target, false, false);
+		if (halt_retval == ERROR_OK && !aarch64->psci_reset_active)
+			return ERROR_OK;
+		if (halt_retval == ERROR_OK && target->state == TARGET_HALTED) {
+			uint64_t stopped_pc = buf_get_u64(armv8->arm.pc->value, 0, 64);
+			LOG_TARGET_ERROR(target, "PSCI reset not confirmed; halted at " TARGET_ADDR_FMT, stopped_pc);
+			if (stopped_pc == aarch64->reset_trampoline + AARCH64_PSCI_RETURN_OFFSET ||
+					stopped_pc == aarch64->reset_trampoline + AARCH64_PSCI_RETURN_OFFSET + 4)
+				LOG_TARGET_ERROR(target, "PSCI SYSTEM_RESET2 returned x0=0x%016" PRIx64,
+						buf_get_u64(armv8_reg_current(&armv8->arm, 0)->value, 0, 64));
+		}
+	}
+	if (halt_retval != ERROR_OK) {
+		target->state = TARGET_UNKNOWN;
+		LOG_TARGET_ERROR(target, "Could not halt after PSCI reset failure");
+	}
+	LOG_TARGET_WARNING(target, "Reset unresolved; resume and step blocked until reset is confirmed. "
+			"Cold reset may be required");
+	return retval;
+
+restore_context:
+	dpm->finish(dpm);
+	int debug_retval = mem_ap_write_atomic_u32(armv8->debug_ap,
+			armv8->debug_base + CPUV8_DBG_EDECR, edecr);
+	int context_retval = aarch64_psci_reset_restore(target);
+	target_to_aarch64(target)->psci_reset_active = false;
+	if (debug_retval != ERROR_OK || context_retval != ERROR_OK) {
+		aarch64->psci_reset_active = true;
+		LOG_TARGET_ERROR(target, "Failed to restore pre-trampoline context; cold reset may be required");
+	}
+	return retval;
+}
+
 static int aarch64_assert_reset(struct target *target)
 {
 	struct armv8_common *armv8 = target_to_armv8(target);
@@ -2018,7 +2432,11 @@ static int aarch64_assert_reset(struct target *target)
 	/* Issue some kind of warm reset. */
 	if (target_has_event_action(target, TARGET_EVENT_RESET_ASSERT))
 		target_handle_event(target, TARGET_EVENT_RESET_ASSERT);
-	else if (reset_config & RESET_HAS_SRST) {
+	else if (reset_config & RESET_HAS_AARCH64_PSCI_RESET) {
+		retval = aarch64_psci_reset(target);
+		if (retval != ERROR_OK)
+			return retval;
+	} else if (reset_config & RESET_HAS_SRST) {
 		bool srst_asserted = false;
 
 		if (target->reset_halt && !(reset_config & RESET_SRST_PULLS_TRST)) {
@@ -2075,11 +2493,34 @@ static int aarch64_deassert_reset(struct target *target)
 
 	LOG_DEBUG(" ");
 
-	/* be certain SRST is off */
-	adapter_deassert_reset();
+	bool psci_reset = (jtag_get_reset_config() & RESET_HAS_AARCH64_PSCI_RESET) &&
+			!target_has_event_action(target, TARGET_EVENT_RESET_ASSERT);
+
+	/* PSCI reset is self-deasserting and must not toggle adapter reset lines. */
+	if (!psci_reset)
+		adapter_deassert_reset();
 
 	if (!target_was_examined(target))
 		return ERROR_OK;
+
+	if (psci_reset) {
+		int64_t then = timeval_ms();
+		for (;;) {
+			uint32_t prsr;
+
+			retval = aarch64_read_prsr(target, &prsr);
+			if (retval != ERROR_OK)
+				return retval;
+			if (!(prsr & PRSR_RESET) && (!target->reset_halt || (prsr & PRSR_HALT)))
+				break;
+			if (timeval_ms() > then + 1000) {
+				LOG_TARGET_ERROR(target, "Timeout waiting for PSCI reset%s",
+						target->reset_halt ? " catch" : " release");
+				return ERROR_TARGET_TIMEOUT;
+			}
+			keep_alive();
+		}
+	}
 
 	retval = aarch64_init_debug_access(target);
 	if (retval != ERROR_OK)
@@ -2910,7 +3351,7 @@ static void aarch64_deinit_target(struct target *target)
 	struct arm_dpm *dpm = &armv8->dpm;
 	uint64_t address;
 
-	if (target->state == TARGET_HALTED) {
+	if (target->state == TARGET_HALTED && !aarch64->psci_reset_active) {
 		// Restore the previous state of the target (gp registers, MMU, caches, etc)
 		int retval = aarch64_restore_one(target, true, &address, false, false);
 		if (retval != ERROR_OK)
@@ -3076,6 +3517,38 @@ static int aarch64_jim_configure(struct target *target, struct jim_getopt_info *
 	}
 
 	return JIM_OK;
+}
+
+COMMAND_HANDLER(aarch64_handle_reset_trampoline_command)
+{
+	if (CMD_ARGC > 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	struct target *target = get_current_target(CMD_CTX);
+	if (!target || strcmp(target->type->name, "aarch64")) {
+		LOG_ERROR("Select an AArch64 target before configuring its PSCI reset trampoline");
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	}
+	struct aarch64_common *aarch64 = target_to_aarch64(target);
+	if (CMD_ARGC) {
+		target_addr_t address;
+		COMMAND_PARSE_NUMBER(u64, CMD_ARGV[0], address);
+		if ((address & (AARCH64_RESET_TRAMPOLINE_SIZE - 1)) ||
+				address > UINT64_MAX - AARCH64_RESET_TRAMPOLINE_SIZE) {
+			LOG_ERROR("PSCI reset trampoline requires 64-byte alignment and room for 64 bytes");
+			return ERROR_COMMAND_ARGUMENT_INVALID;
+		}
+		if (aarch64->psci_reset_active) {
+			LOG_TARGET_ERROR(target, "Cannot move an unresolved PSCI reset trampoline; cold reset first");
+			return ERROR_TARGET_FAILURE;
+		}
+		aarch64->reset_trampoline = address;
+		aarch64->reset_trampoline_set = true;
+	}
+	if (aarch64->reset_trampoline_set)
+		command_print(CMD, TARGET_ADDR_FMT, aarch64->reset_trampoline);
+	else
+		command_print(CMD, "not configured");
+	return ERROR_OK;
 }
 
 COMMAND_HANDLER(aarch64_handle_cache_info_command)
@@ -3406,6 +3879,13 @@ COMMAND_HANDLER(aarch64_mcrmrc_command)
 }
 
 static const struct command_registration aarch64_exec_command_handlers[] = {
+	{
+		.name = "reset_trampoline",
+		.handler = aarch64_handle_reset_trampoline_command,
+		.mode = COMMAND_ANY,
+		.help = "configure reserved physical RAM for normal-state PSCI SMC (64 bytes, overwritten)",
+		.usage = "[physical_address]",
+	},
 	{
 		.name = "cache_info",
 		.handler = aarch64_handle_cache_info_command,

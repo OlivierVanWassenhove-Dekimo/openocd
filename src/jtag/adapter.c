@@ -519,7 +519,7 @@ COMMAND_HANDLER(handle_reset_config_command)
 			goto next;
 
 		/* signals */
-		m = RESET_HAS_TRST | RESET_HAS_SRST;
+		m = RESET_HAS_TRST | RESET_HAS_SRST | RESET_HAS_AARCH64_PSCI_RESET;
 		if (strcmp(*CMD_ARGV, "none") == 0)
 			tmp = RESET_NONE;
 		else if (strcmp(*CMD_ARGV, "trst_only") == 0)
@@ -528,6 +528,8 @@ COMMAND_HANDLER(handle_reset_config_command)
 			tmp = RESET_HAS_SRST;
 		else if (strcmp(*CMD_ARGV, "trst_and_srst") == 0)
 			tmp = RESET_HAS_TRST | RESET_HAS_SRST;
+		else if (strcmp(*CMD_ARGV, "aarch64_psci_reset") == 0)
+			tmp = RESET_HAS_AARCH64_PSCI_RESET;
 		else
 			m = 0;
 		if (mask & m) {
@@ -636,7 +638,10 @@ next:
 	char *modes[6];
 
 	/* minimal JTAG has neither SRST nor TRST (so that's the default) */
-	switch (new_cfg & (RESET_HAS_TRST | RESET_HAS_SRST)) {
+	switch (new_cfg & (RESET_HAS_TRST | RESET_HAS_SRST | RESET_HAS_AARCH64_PSCI_RESET)) {
+	case RESET_HAS_AARCH64_PSCI_RESET:
+		modes[0] = "aarch64_psci_reset";
+		break;
 	case RESET_HAS_SRST:
 		modes[0] = "srst_only";
 		break;
@@ -1308,8 +1313,8 @@ static const struct command_registration interface_command_handlers[] = {
 		.name = "reset_config",
 		.handler = handle_reset_config_command,
 		.mode = COMMAND_ANY,
-		.help = "configure adapter reset behavior",
-		.usage = "[none|trst_only|srst_only|trst_and_srst] "
+		.help = "configure adapter and target reset behavior",
+		.usage = "[none|trst_only|srst_only|trst_and_srst|aarch64_psci_reset] "
 			"[srst_pulls_trst|trst_pulls_srst|combined|separate] "
 			"[srst_gates_jtag|srst_nogate] "
 			"[trst_push_pull|trst_open_drain] "

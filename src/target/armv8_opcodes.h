@@ -37,6 +37,8 @@
 #define SYSTEM_SCTLR_EL1	0xC080
 #define SYSTEM_SCTLR_EL2	0xE080
 #define SYSTEM_SCTLR_EL3	0xF080
+#define SYSTEM_HCR_EL2		0xE088
+#define SYSTEM_ID_AA64PFR0_EL1	0xC020
 
 #define SYSTEM_FPCR		0xDA20
 #define SYSTEM_FPSR		0xDA21
@@ -124,6 +126,7 @@
 #define ARMV8_DCPS(el, im)	(0xd4a00000 | (((im) & 0xFFFF) << 5) | el)
 #define ARMV8_DCPS_T1(el)	(0xf78f8000 | el)
 #define ARMV8_DRPS		0xd6bf03e0
+#define ARMV8_SMC(im)		(0xd4000003 | (((im) & 0xFFFF) << 5))
 #define ARMV8_ERET_T1		0xf3de8f00
 
 #define ARMV8_DSB_SY				0xd5033F9F

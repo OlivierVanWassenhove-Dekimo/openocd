@@ -4321,7 +4321,42 @@ it must explicitly be driven high (@option{srst_push_pull}).
 For example, If the JTAG interface provides SRST, but the board doesn't
 connect that signal properly, then OpenOCD can't use it.
 Possible values are @option{none} (the default), @option{trst_only},
-@option{srst_only} and @option{trst_and_srst}.
+@option{srst_only}, @option{trst_and_srst} and @option{aarch64_psci_reset}.
+
+@option{aarch64_psci_reset} invokes firmware's PSCI v1.1
+@code{SYSTEM_RESET2} service instead of using SRST or TRST. OpenOCD emits
+@code{SMC #0} with @code{x0 = 0xc4000012}, @code{x1 = 0} (architectural
+warm reset), and @code{x2 = 0} (cookie). On Agilex 5 this invokes TF-A's
+@code{socfpga_system_reset2}, delegating reset preparation and handshakes
+to firmware. A dedicated RAM trampoline loads the arguments and executes
+SMC in normal execution state. Configure its physical
+address with @command{aarch64 reset_trampoline}.
+
+This mode supports only a single examined AArch64 target in non-secure
+EL1 or EL2; OpenOCD halts it first if necessary. The EL3 PSCI runtime must
+already be initialized, SMCs must route to AArch64 EL3, and secure invasive
+debug access must be permitted. Resetting while stopped in EL3 firmware is
+not supported. EL1 callers must have @code{HCR_EL2.VM}, @code{DC}, @code{TSC}
+and @code{TGE} clear; otherwise OpenOCD refuses the operation.
+
+OpenOCD disables only the caller's stage-1 MMU and instruction cache for
+physical stub fetch, preserving its D-cache contents and firmware's EL3
+stack/MMU/cache configuration. The stub masks interrupts and needs no stack
+or application symbols. If PSCI returns, an HLT instruction followed by a
+loop traps execution in the reserved region, preserving the returned
+@code{x0}.
+
+@command{reset halt} and @command{reset init} arm architectural Reset Catch.
+The request is self-deasserting and cannot be held asserted. Firmware
+controls reset scope; debug-domain state and hardware breakpoints/watchpoints
+may not survive. Software breakpoints require their patched memory to survive.
+Other cores are not quiesced by OpenOCD.
+
+Setup failures before restart attempt to restore the cached CPU context.
+After restart, a failed or timed-out reset attempts to halt actual firmware
+execution and attempts to retain Reset Catch. Ordinary
+@command{resume} and @command{step} are blocked until reset is confirmed;
+a cold reset may be required.
 
 @quotation Tip
 If your board provides SRST and/or TRST through the JTAG connector,
@@ -11580,6 +11615,41 @@ instead.
 @subsection ARMv8-A specific commands
 @cindex ARMv8-A
 @cindex aarch64
+
+@deffn {Command} {aarch64 reset_trampoline} [physical_address]
+Configure or display the physical RAM address used by
+@command{reset_config aarch64_psci_reset} for the current AArch64 target.
+Use 64 bytes of 64-byte-aligned, writable non-secure RAM. Normally this
+must be reserved and unused by firmware, application data, DMA and other
+cores. The contents are overwritten without backup.
+
+The Agilex 5 configuration defaults to @code{0x80100000}, the start of
+non-secure DDR after stock TF-A's secure first 1 MiB. This overlaps the
+current Zephyr image header/entry point: its first 32 bytes are overwritten.
+Using this default requires boot firmware to reload the image before
+entering it. If firmware reuses the resident image, reserve a separate
+non-secure region and override @code{RESET_TRAMPOLINE_ADDR} before loading
+the script. OpenOCD does not restore the image header or reconfigure the
+DDR firewall. A breakpoint in the trampoline prevents reset execution;
+set the boot-entry breakpoint after @command{reset halt}, not before it.
+Agilex 5 TF-A's warm-boot path can request an additional CPU reset after
+this first Reset Catch. A breakpoint programmed at the first catch may
+therefore lose its hardware configuration during subsequent boot.
+
+OpenOCD writes and reads back a 32-byte little-endian stub, cleans its
+D-cache lines to PoC before and after writing, invalidates the caller's
+instruction cache and executes synchronization barriers. The stub loads
+@code{x0 = 0xc4000012}, @code{x1 = 0}, @code{x2 = 0}, then executes
+@code{SMC #0} outside Debug state. At the default address, the SMC is at
+@code{0x80100014}; a returned call traps in the HLT/loop at
+@code{0x80100018}/@code{0x8010001c}.
+
+Before restart, setup failures attempt to restore the original CPU and
+system-control state. After restart, OpenOCD does not restore the
+application after an unconfirmed reset; the caller's stage-1 MMU and
+instruction cache may remain disabled. Resume, step and trampoline relocation
+are blocked until reset is confirmed; a cold reset may be required.
+@end deffn
 
 @deffn {Command} {aarch64 cache_info}
 Display information about target caches

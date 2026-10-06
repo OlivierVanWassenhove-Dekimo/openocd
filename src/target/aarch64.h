@@ -44,6 +44,11 @@ struct aarch64_common {
 	uint64_t system_control_reg;
 	uint64_t system_control_reg_curr;
 
+	/* Reserved physical RAM for the normal-state PSCI SMC stub. */
+	target_addr_t reset_trampoline;
+	bool reset_trampoline_set;
+	bool psci_reset_active;
+
 	/* Breakpoint register pairs */
 	int brp_num_context;
 	int brp_num;

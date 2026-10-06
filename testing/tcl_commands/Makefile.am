@@ -6,7 +6,9 @@ if DUMMY
 TESTS += \
 	test-target-create-command.cfg \
 	test-target-configure-cget-command.cfg \
-	test-target-smp-command.cfg
+	test-target-smp-command.cfg \
+	test-reset-config-command.cfg \
+	test-aarch64-psci-reset-command.cfg
 endif
 
 EXTRA_DIST = utils.tcl $(TESTS)

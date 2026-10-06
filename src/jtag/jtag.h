@@ -247,7 +247,9 @@ enum reset_types
 	RESET_TRST_OPEN_DRAIN = 0x10,
 	RESET_SRST_PUSH_PULL = 0x20,
 	RESET_SRST_NO_GATING = 0x40,
-	RESET_CNCT_UNDER_SRST = 0x80
+	RESET_CNCT_UNDER_SRST = 0x80,
+	/* AArch64 PSCI SYSTEM_RESET2 via SMC, without asserting SRST/TRST. */
+	RESET_HAS_AARCH64_PSCI_RESET = 0x100
 };
 
 enum reset_types jtag_get_reset_config(void);
